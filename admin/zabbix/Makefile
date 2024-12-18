@@ -8,13 +8,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=zabbix
-PKG_VERSION:=6.2.3
-PKG_RELEASE:=4
+PKG_VERSION:=6.4.7
+PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://cdn.zabbix.com/zabbix/sources/stable/$(basename $(PKG_VERSION))/ \
 	https://cdn.zabbix.com/zabbix/sources/oldstable/$(basename $(PKG_VERSION))/
-PKG_HASH:=2be7e57fb33a55fee71480598e317ffa6a8ee5a39639a7e1b42b2ea6872107b5
+PKG_HASH:=6b4e81f07de4c82c7994871bea51be4d6427683fa9a7fbe112fd7559b3670e49
 
 PKG_MAINTAINER:=Etienne CHAMPETIER <champetier.etienne@gmail.com>
 PKG_LICENSE:=GPL-2.0
@@ -63,6 +63,7 @@ endef
 define Package/zabbix-agentd
   $(call Package/zabbix/Default)
   TITLE+= agentd
+  DEPENDS+= +libevent2-pthreads
   PROVIDES:=zabbix-agentd
   VARIANT:=nossl
   DEFAULT_VARIANT:=1
@@ -71,7 +72,7 @@ endef
 define Package/zabbix-agentd-openssl
   $(call Package/zabbix/Default)
   TITLE+= agentd (with OpenSSL)
-  DEPENDS+= +libopenssl
+  DEPENDS+= +libevent2-pthreads +libopenssl
   PROVIDES:=zabbix-agentd
   VARIANT:=openssl
 endef
@@ -79,7 +80,7 @@ endef
 define Package/zabbix-agentd-gnutls
   $(call Package/zabbix/Default)
   TITLE+= agentd (with GnuTLS)
-  DEPENDS+= +libgnutls
+  DEPENDS+= +libevent2-pthreads +libgnutls
   PROVIDES:=zabbix-agentd
   VARIANT:=gnutls
 endef
@@ -157,6 +158,7 @@ define Package/zabbix-server/Default
     +ZABBIX_MYSQL:libmariadbclient \
     @(!ZABBIX_SQLITE) \
     +libevent2 \
+    +libevent2-pthreads \
     +fping
 endef
 
@@ -209,6 +211,7 @@ define Package/zabbix-proxy/Default
     +ZABBIX_MYSQL:libmariadbclient \
     +ZABBIX_SQLITE:libsqlite3 \
     +libevent2 \
+    +libevent2-pthreads \
     +fping
 endef
 
@@ -262,7 +265,7 @@ CONFIGURE_ARGS+= \
 	$(if $(CONFIG_ZABBIX_MYSQL),--with-mysql) \
 	$(if $(CONFIG_ZABBIX_POSTGRESQL),--with-postgresql) \
 	$(if $(CONFIG_ZABBIX_SQLITE),--with-sqlite3=$(STAGING_DIR)/usr) \
-	--with-libevent=$(STAGING_DIR)/usr/include/libevent \
+	--with-libevent=$(STAGING_DIR)/usr/include \
 	--with-libpcre2=$(STAGING_DIR)/usr/include \
 	--with-zlib=$(STAGING_DIR)/usr/include
 

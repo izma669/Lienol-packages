@@ -1,19 +1,22 @@
 # banIP shared function library/include - ban incoming and outgoing IPs via named nftables Sets
-# Copyright (c) 2018-2023 Dirk Brenken (dev@brenken.org)
+# Copyright (c) 2018-2024 Dirk Brenken (dev@brenken.org)
 # This is free software, licensed under the GNU General Public License v3.
 
 # (s)hellcheck exceptions
 # shellcheck disable=all
 
-# set initial defaults
+# environment
 #
 export LC_ALL=C
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
+# initial defaults
+#
 ban_basedir="/tmp"
 ban_backupdir="/tmp/banIP-backup"
 ban_reportdir="/tmp/banIP-report"
 ban_feedfile="/etc/banip/banip.feeds"
+ban_countryfile="/etc/banip/banip.countries"
 ban_customfeedfile="/etc/banip/banip.custom.feeds"
 ban_allowlist="/etc/banip/banip.allowlist"
 ban_blocklist="/etc/banip/banip.blocklist"
@@ -25,37 +28,33 @@ ban_rdapurl="https://rdap.db.ripe.net/ip/"
 ban_lock="/var/run/banip.lock"
 ban_logreadfile="/var/log/messages"
 ban_logreadcmd=""
-ban_logcmd="$(command -v logger)"
-ban_ubuscmd="$(command -v ubus)"
-ban_nftcmd="$(command -v nft)"
-ban_fw4cmd="$(command -v fw4)"
-ban_awkcmd="$(command -v awk)"
-ban_grepcmd="$(command -v grep)"
-ban_sedcmd="$(command -v sed)"
-ban_catcmd="$(command -v cat)"
-ban_zcatcmd="$(command -v zcat)"
-ban_lookupcmd="$(command -v nslookup)"
-ban_jsoncmd="$(command -v jsonfilter)"
-ban_mailcmd="$(command -v msmtp)"
 ban_mailsender="no-reply@banIP"
 ban_mailreceiver=""
 ban_mailtopic="banIP notification"
 ban_mailprofile="ban_notify"
 ban_mailnotification="0"
 ban_reportelements="1"
+ban_remotelog="0"
+ban_remotetoken=""
 ban_nftloglevel="warn"
-ban_nftpriority="-200"
+ban_nftpriority="-100"
 ban_nftpolicy="memory"
 ban_nftexpiry=""
 ban_loglimit="100"
+ban_icmplimit="10"
+ban_synlimit="10"
+ban_udplimit="100"
 ban_logcount="1"
 ban_logterm=""
+ban_region=""
 ban_country=""
 ban_asn=""
-ban_loginput="1"
-ban_logforwardwan="1"
+ban_logprerouting="0"
+ban_loginput="0"
+ban_logforwardwan="0"
 ban_logforwardlan="0"
 ban_allowurl=""
+ban_allowflag=""
 ban_allowlistonly="0"
 ban_autoallowlist="1"
 ban_autoallowuplink="subnet"
@@ -85,7 +84,6 @@ ban_fetchretry="5"
 ban_rdapparm=""
 ban_etagparm=""
 ban_cores=""
-ban_memory=""
 ban_packages=""
 ban_trigger=""
 ban_resolver=""
@@ -98,20 +96,41 @@ f_system() {
 	local cpu core
 
 	if [ -z "${ban_dev}" ]; then
-		ban_debug="$(uci_get banip global ban_debug)"
+		ban_debug="$(uci_get banip global ban_debug "0")"
 		ban_cores="$(uci_get banip global ban_cores)"
 	fi
-	ban_packages="$(${ban_ubuscmd} -S call rpc-sys packagelist '{ "all": true }' 2>/dev/null)"
-	ban_memory="$("${ban_awkcmd}" '/^MemAvailable/{printf "%s",int($2/1000)}' "/proc/meminfo" 2>/dev/null)"
+	ban_packages="$("${ban_ubuscmd}" -S call rpc-sys packagelist '{ "all": true }' 2>/dev/null)"
 	ban_ver="$(printf "%s" "${ban_packages}" | "${ban_jsoncmd}" -ql1 -e '@.packages.banip')"
-	ban_sysver="$("${ban_ubuscmd}" -S call system board 2>/dev/null | "${ban_jsoncmd}" -ql1 -e '@.model' -e '@.release.description' |
-		"${ban_awkcmd}" 'BEGIN{RS="";FS="\n"}{printf "%s, %s",$1,$2}')"
+	ban_sysver="$("${ban_ubuscmd}" -S call system board 2>/dev/null | "${ban_jsoncmd}" -ql1 -e '@.model' -e '@.release.target' -e '@.release.distribution' -e '@.release.version' -e '@.release.revision' |
+			"${ban_awkcmd}" 'BEGIN{RS="";FS="\n"}{printf "%s, %s, %s %s %s %s",$1,$2,$3,$4,$5,$6}')"
 	if [ -z "${ban_cores}" ]; then
 		cpu="$("${ban_grepcmd}" -c '^processor' /proc/cpuinfo 2>/dev/null)"
 		core="$("${ban_grepcmd}" -cm1 '^core id' /proc/cpuinfo 2>/dev/null)"
 		[ "${cpu}" = "0" ] && cpu="1"
 		[ "${core}" = "0" ] && core="1"
 		ban_cores="$((cpu * core))"
+		[ "${ban_cores}" -gt "16" ] && ban_cores="16"
+	fi
+}
+
+# command selector
+#
+f_cmd() {
+	local cmd pri_cmd="${1}" sec_cmd="${2}"
+
+	cmd="$(command -v "${pri_cmd}" 2>/dev/null)"
+	if [ ! -x "${cmd}" ]; then
+		if [ -n "${sec_cmd}" ]; then
+			[ "${sec_cmd}" = "optional" ] && return
+			cmd="$(command -v "${sec_cmd}" 2>/dev/null)"
+		fi
+		if [ -x "${cmd}" ]; then
+			printf "%s" "${cmd}"
+		else
+			f_log "emerg" "command '${pri_cmd:-"-"}'/'${sec_cmd:-"-"}' not found"
+		fi
+	else
+		printf "%s" "${cmd}"
 	fi
 }
 
@@ -190,16 +209,15 @@ f_rmpid() {
 
 	ppid="$("${ban_catcmd}" "${ban_pidfile}" 2>/dev/null)"
 	if [ -n "${ppid}" ]; then
-		pids="$(pgrep -P "${ppid}" 2>/dev/null)"
+		pids="$("${ban_pgrepcmd}" -P "${ppid}" 2>/dev/null)"
 		for pid in ${pids}; do
-			pids="${pids} $(pgrep -P "${pid}" 2>/dev/null)"
+			pids="${pids} $("${ban_pgrepcmd}" -P "${pid}" 2>/dev/null)"
 		done
 		for pid in ${pids}; do
 			kill -INT "${pid}" >/dev/null 2>&1
 		done
 	fi
-	: >"${ban_rdapfile}"
-	: >"${ban_pidfile}"
+	: >"${ban_rdapfile}" >"${ban_pidfile}"
 }
 
 # write log messages
@@ -209,18 +227,20 @@ f_log() {
 
 	if [ -n "${log_msg}" ] && { [ "${class}" != "debug" ] || [ "${ban_debug}" = "1" ]; }; then
 		if [ -x "${ban_logcmd}" ]; then
-			"${ban_logcmd}" -p "${class}" -t "banIP-${ban_ver}[${$}]" "${log_msg}"
+			"${ban_logcmd}" -p "${class}" -t "banIP-${ban_ver}[${$}]" "${log_msg::512}"
 		else
-			printf "%s %s %s\n" "${class}" "banIP-${ban_ver}[${$}]" "${log_msg}"
+			printf "%s %s %s\n" "${class}" "banIP-${ban_ver}[${$}]" "${log_msg::512}"
 		fi
 	fi
-	if [ "${class}" = "err" ]; then
-		"${ban_nftcmd}" delete table inet banIP >/dev/null 2>&1
-		if [ "${ban_enabled}" = "1" ]; then
-			f_genstatus "error"
-			[ "${ban_mailnotification}" = "1" ] && [ -n "${ban_mailreceiver}" ] && [ -x "${ban_mailcmd}" ] && f_mail
-		else
-			f_genstatus "disabled"
+	if [ "${class}" = "err" ] || [ "${class}" = "emerg" ]; then
+		if [ "${class}" = "err" ]; then
+			"${ban_nftcmd}" delete table inet banIP >/dev/null 2>&1
+			if [ "$(uci_get banip global ban_enabled)" = "1" ]; then
+				f_genstatus "error"
+				[ "${ban_mailnotification}" = "1" ] && [ -n "${ban_mailreceiver}" ] && [ -x "${ban_mailcmd}" ] && f_mail
+			else
+				f_genstatus "disabled"
+			fi
 		fi
 		f_rmdir "${ban_tmpdir}"
 		f_rmpid
@@ -232,7 +252,9 @@ f_log() {
 # load config
 #
 f_conf() {
-	unset ban_dev ban_vlanallow ban_vlanblock ban_ifv4 ban_ifv6 ban_feed ban_allowurl ban_blockinput ban_blockforwardwan ban_blockforwardlan ban_logterm ban_country ban_asn
+	local rir ccode region country
+
+	unset ban_dev ban_vlanallow ban_vlanblock ban_ifv4 ban_ifv6 ban_feed ban_allowurl ban_blockinput ban_blockforwardwan ban_blockforwardlan ban_logterm ban_region ban_country ban_asn
 	config_cb() {
 		option_cb() {
 			local option="${1}"
@@ -279,6 +301,9 @@ f_conf() {
 				"ban_logterm")
 					eval "${option}=\"$(printf "%s" "${ban_logterm}")${value}\\|\""
 					;;
+				"ban_region")
+					eval "${option}=\"$(printf "%s" "${ban_region}")${value} \""
+					;;
 				"ban_country")
 					eval "${option}=\"$(printf "%s" "${ban_country}")${value} \""
 					;;
@@ -290,12 +315,20 @@ f_conf() {
 	}
 	config_load banip
 	[ -f "${ban_logreadfile}" ] && ban_logreadcmd="$(command -v tail)" || ban_logreadcmd="$(command -v logread)"
+
+	for rir in ${ban_region}; do
+		while read -r ccode region country; do
+			if [ "${rir}" = "${region}" ] && ! printf "%s" "${ban_country}" | "${ban_grepcmd}" -qw "${ccode}"; then
+				ban_country="${ban_country} ${ccode}"
+			fi
+		done <"${ban_countryfile}"
+	done
 }
 
 # get nft/monitor actuals
 #
 f_actual() {
-	local nft monitor ppid pid
+	local nft monitor ppid pids pid
 
 	if "${ban_nftcmd}" -t list set inet banIP allowlistv4MAC >/dev/null 2>&1; then
 		nft="$(f_char "1")"
@@ -305,10 +338,15 @@ f_actual() {
 
 	ppid="$("${ban_catcmd}" "${ban_pidfile}" 2>/dev/null)"
 	if [ -n "${ppid}" ]; then
-		pid="$(pgrep -oP "${ppid}" 2>/dev/null)"
-	fi
-	if pgrep -f "${ban_logreadcmd##*/}" -P "${pid}" >/dev/null 2>&1; then
-		monitor="$(f_char "1")"
+		pids="$("${ban_pgrepcmd}" -P "${ppid}" 2>/dev/null)"
+		for pid in ${pids}; do
+			if "${ban_pgrepcmd}" -f "${ban_logreadcmd##*/}" -P "${pid}" >/dev/null 2>&1; then
+				monitor="$(f_char "1")"
+				break
+			else
+				monitor="$(f_char "0")"
+			fi
+		done
 	else
 		monitor="$(f_char "0")"
 	fi
@@ -318,26 +356,28 @@ f_actual() {
 # get fetch utility
 #
 f_getfetch() {
-	local item utils insecure update="0"
+	local util utils insecure
 
-	if { [ "${ban_fetchcmd}" = "uclient-fetch" ] && printf "%s" "${ban_packages}" | "${ban_grepcmd}" -q '"libustream-'; } ||
-		{ [ "${ban_fetchcmd}" = "wget" ] && printf "%s" "${ban_packages}" | "${ban_grepcmd}" -q '"wget-ssl'; } ||
-		[ "${ban_fetchcmd}" = "curl" ] || [ "${ban_fetchcmd}" = "aria2c" ]; then
-		ban_fetchcmd="$(command -v "${ban_fetchcmd}")"
-	else
-		ban_fetchcmd=""
-	fi
+	ban_fetchcmd="$(command -v "${ban_fetchcmd}")"
+	if { [ "${ban_autodetect}" = "1" ] && [ -z "${ban_fetchcmd}" ]; } || [ ! -x "${ban_fetchcmd}" ]; then
+		utils="aria2 curl wget-ssl libustream-openssl libustream-wolfssl libustream-mbedtls"
+		for util in ${utils}; do
+			if printf "%s" "${ban_packages}" | "${ban_jsoncmd}" -ql1 -e "@.packages[\"${util}\"]" >/dev/null 2>&1; then
+				case "${util}" in
+					"aria2")
+						util="aria2c"
+						;;
+					"wget-ssl")
+						util="wget"
+						;;
+					"libustream-openssl" | "libustream-wolfssl" | "libustream-mbedtls")
+						util="uclient-fetch"
+						;;
+				esac
 
-	if [ "${ban_autodetect}" = "1" ] && [ ! -x "${ban_fetchcmd}" ]; then
-		utils="aria2c curl wget uclient-fetch"
-		for item in ${utils}; do
-			if { [ "${item}" = "uclient-fetch" ] && printf "%s" "${ban_packages}" | "${ban_grepcmd}" -q '"libustream-'; } ||
-				{ [ "${item}" = "wget" ] && printf "%s" "${ban_packages}" | "${ban_grepcmd}" -q '"wget-ssl'; } ||
-				[ "${item}" = "curl" ] || [ "${item}" = "aria2c" ]; then
-				ban_fetchcmd="$(command -v "${item}")"
-				if [ -x "${ban_fetchcmd}" ]; then
-					update="1"
-					uci_set banip global ban_fetchcmd "${item}"
+				if [ -x "$(command -v "${util}")" ]; then
+					ban_fetchcmd="$(command -v "${util}")"
+					uci_set banip global ban_fetchcmd "${util}"
 					uci_commit "banip"
 					break
 				fi
@@ -345,7 +385,8 @@ f_getfetch() {
 		done
 	fi
 
-	[ ! -x "${ban_fetchcmd}" ] && f_log "err" "no download utility with SSL support"
+	[ ! -x "${ban_fetchcmd}" ] && f_log "err" "download utility with SSL support not found, please set 'ban_fetchcmd' manually"
+
 	case "${ban_fetchcmd##*/}" in
 		"aria2c")
 			[ "${ban_fetchinsecure}" = "1" ] && insecure="--check-certificate=false"
@@ -372,50 +413,53 @@ f_getfetch() {
 			;;
 	esac
 
-	f_log "debug" "f_getfetch  ::: auto/update: ${ban_autodetect}/${update}, cmd: ${ban_fetchcmd:-"-"}, fetch_parm: ${ban_fetchparm:-"-"}, rdap_parm: ${ban_rdapparm:-"-"}, etag_parm: ${ban_etagparm:-"-"}"
+	f_log "debug" "f_getfetch  ::: auto: ${ban_autodetect}, cmd: ${ban_fetchcmd:-"-"}, fetch_parm: ${ban_fetchparm:-"-"}, rdap_parm: ${ban_rdapparm:-"-"}, etag_parm: ${ban_etagparm:-"-"}"
 }
 
 # get wan interfaces
 #
 f_getif() {
-	local iface update="0"
+	local iface iface_del update="0"
 
 	if [ "${ban_autodetect}" = "1" ]; then
-		if [ -z "${ban_ifv4}" ]; then
-			network_flush_cache
-			network_find_wan iface
-			if [ -n "${iface}" ] && "${ban_ubuscmd}" -t 10 wait_for network.interface."${iface}" >/dev/null 2>&1; then
-				ban_protov4="1"
-				ban_ifv4="${iface}"
-				uci_set banip global ban_protov4 "1"
-				uci_add_list banip global ban_ifv4 "${iface}"
-				f_log "info" "add IPv4 interface '${iface}' to config"
-			fi
+		network_flush_cache
+		network_find_wan iface
+		if [ -n "${iface}" ] && [ "${iface}" != "$(f_trim "${ban_ifv4}")" ] && "${ban_ubuscmd}" -t 10 wait_for network.interface."${iface}" >/dev/null 2>&1; then
+			for iface_del in ${ban_ifv4}; do
+				uci_remove_list banip global ban_ifv4 "${iface_del}"
+				f_log "info" "remove IPv4 interface '${iface_del}' from config"
+			done
+			ban_protov4="1"
+			ban_ifv4="${iface}"
+			uci_set banip global ban_protov4 "1"
+			uci_add_list banip global ban_ifv4 "${iface}"
+			f_log "info" "add IPv4 interface '${iface}' to config"
 		fi
-		if [ -z "${ban_ifv6}" ]; then
-			network_flush_cache
-			network_find_wan6 iface
-			if [ -n "${iface}" ] && "${ban_ubuscmd}" -t 10 wait_for network.interface."${iface}" >/dev/null 2>&1; then
-				ban_protov6="1"
-				ban_ifv6="${iface}"
-				uci_set banip global ban_protov6 "1"
-				uci_add_list banip global ban_ifv6 "${iface}"
-				f_log "info" "add IPv6 interface '${iface}' to config"
-			fi
+		network_find_wan6 iface
+		if [ -n "${iface}" ] && [ "${iface}" != "$(f_trim "${ban_ifv6}")" ] && "${ban_ubuscmd}" -t 10 wait_for network.interface."${iface}" >/dev/null 2>&1; then
+			for iface_del in ${ban_ifv6}; do
+				uci_remove_list banip global ban_ifv6 "${iface_del}"
+				f_log "info" "remove IPv6 interface '${iface_del}' from config"
+			done
+			ban_protov6="1"
+			ban_ifv6="${iface}"
+			uci_set banip global ban_protov6 "1"
+			uci_add_list banip global ban_ifv6 "${iface}"
+			f_log "info" "add IPv6 interface '${iface}' to config"
 		fi
 	fi
 	if [ -n "$(uci -q changes "banip")" ]; then
 		update="1"
 		uci_commit "banip"
 	else
-		ban_ifv4="${ban_ifv4%%?}"
-		ban_ifv6="${ban_ifv6%%?}"
 		for iface in ${ban_ifv4} ${ban_ifv6}; do
 			if ! "${ban_ubuscmd}" -t 10 wait_for network.interface."${iface}" >/dev/null 2>&1; then
 				f_log "err" "no wan interface '${iface}'"
 			fi
 		done
 	fi
+	ban_ifv4="$(f_trim "${ban_ifv4}")"
+	ban_ifv6="$(f_trim "${ban_ifv6}")"
 	[ -z "${ban_ifv4}" ] && [ -z "${ban_ifv6}" ] && f_log "err" "no wan interfaces"
 
 	f_log "debug" "f_getif     ::: auto/update: ${ban_autodetect}/${update}, interfaces (4/6): ${ban_ifv4}/${ban_ifv6}, protocols (4/6): ${ban_protov4}/${ban_protov6}"
@@ -424,31 +468,36 @@ f_getif() {
 # get wan devices
 #
 f_getdev() {
-	local dev iface update="0" cnt="0" cnt_max="30"
+	local dev dev_del iface update="0"
 
 	if [ "${ban_autodetect}" = "1" ]; then
-		while [ "${cnt}" -lt "${cnt_max}" ] && [ -z "${ban_dev}" ]; do
-			network_flush_cache
-			for iface in ${ban_ifv4} ${ban_ifv6}; do
-				network_get_device dev "${iface}"
-				if [ -n "${dev}" ] && ! printf " %s " "${ban_dev}" | "${ban_grepcmd}" -q " ${dev} "; then
+		network_flush_cache
+		dev_del="${ban_dev}"
+		for iface in ${ban_ifv4} ${ban_ifv6}; do
+			network_get_device dev "${iface}"
+			if [ -n "${dev}" ]; then
+				dev_del="${dev_del/${dev} / }"
+				if ! printf " %s " "${ban_dev}" | "${ban_grepcmd}" -q " ${dev} "; then
 					ban_dev="${ban_dev}${dev} "
 					uci_add_list banip global ban_dev "${dev}"
 					f_log "info" "add device '${dev}' to config"
 				fi
-			done
-			cnt="$((cnt + 1))"
-			sleep 1
+			fi
+		done
+		for dev in ${dev_del}; do
+			ban_dev="${ban_dev/${dev} / }"
+			uci_remove_list banip global ban_dev "${dev}"
+			f_log "info" "remove device '${dev}' from config"
 		done
 	fi
 	if [ -n "$(uci -q changes "banip")" ]; then
 		update="1"
 		uci_commit "banip"
 	fi
-	ban_dev="${ban_dev%%?}"
+	ban_dev="$(f_trim "${ban_dev}")"
 	[ -z "${ban_dev}" ] && f_log "err" "no wan devices"
 
-	f_log "debug" "f_getdev    ::: auto/update: ${ban_autodetect}/${update}, wan_devices: ${ban_dev}, cnt: ${cnt}"
+	f_log "debug" "f_getdev    ::: auto/update: ${ban_autodetect}/${update}, wan_devices: ${ban_dev}"
 }
 
 # get local uplink
@@ -481,12 +530,12 @@ f_getuplink() {
 				if [ "${update}" = "0" ]; then
 					"${ban_sedcmd}" -i "/# uplink added on /d" "${ban_allowlist}"
 				fi
-				printf "%-42s%s\n" "${ip}" "# uplink added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_allowlist}"
+				printf "%-45s%s\n" "${ip}" "# uplink added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_allowlist}"
 				f_log "info" "add uplink '${ip}' to local allowlist"
 				update="1"
 			fi
 		done
-		ban_uplink="${ban_uplink%%?}"
+		ban_uplink="$(f_trim "${ban_uplink}")"
 	elif [ "${ban_autoallowlist}" = "1" ] && [ "${ban_autoallowuplink}" = "disable" ]; then
 		"${ban_sedcmd}" -i "/# uplink added on /d" "${ban_allowlist}"
 		update="1"
@@ -549,50 +598,98 @@ f_etag() {
 # build initial nft file with base table, chains and rules
 #
 f_nftinit() {
-	local wan_dev vlan_allow vlan_block feed_log feed_rc file="${1}"
+	local wan_dev vlan_allow vlan_block log_ct log_icmp log_syn log_udp log_tcp feed_log feed_rc flag tmp_proto tmp_port allow_dport file="${1}"
 
 	wan_dev="$(printf "%s" "${ban_dev}" | "${ban_sedcmd}" 's/^/\"/;s/$/\"/;s/ /\", \"/g')"
 	[ -n "${ban_vlanallow}" ] && vlan_allow="$(printf "%s" "${ban_vlanallow%%?}" | "${ban_sedcmd}" 's/^/\"/;s/$/\"/;s/ /\", \"/g')"
 	[ -n "${ban_vlanblock}" ] && vlan_block="$(printf "%s" "${ban_vlanblock%%?}" | "${ban_sedcmd}" 's/^/\"/;s/$/\"/;s/ /\", \"/g')"
 
+	for flag in ${ban_allowflag}; do
+		if [ "${flag}" = "tcp" ] || [ "${flag}" = "udp" ]; then
+			if [ -z "${tmp_proto}" ]; then
+				tmp_proto="${flag}"
+			elif ! printf "%s" "${tmp_proto}" | "${ban_grepcmd}" -qw "${flag}"; then
+				tmp_proto="${tmp_proto}, ${flag}"
+			fi
+		elif [ -n "${flag//[![:digit:]-]/}" ]; then
+			if [ -z "${tmp_port}" ]; then
+				tmp_port="${flag}"
+			elif ! printf "%s" "${tmp_port}" | "${ban_grepcmd}" -qw "${flag}"; then
+				tmp_port="${tmp_port}, ${flag}"
+			fi
+		fi
+	done
+	if [ -n "${tmp_proto}" ] && [ -n "${tmp_port}" ]; then
+		allow_dport="meta l4proto { ${tmp_proto} } th dport { ${tmp_port} }"
+	fi
+
+	if [ "${ban_logprerouting}" = "1" ]; then
+		log_icmp="log level ${ban_nftloglevel} prefix \"banIP/pre-icmp/drop: \""
+		log_syn="log level ${ban_nftloglevel} prefix \"banIP/pre-syn/drop: \""
+		log_udp="log level ${ban_nftloglevel} prefix \"banIP/pre-udp/drop: \""
+		log_tcp="log level ${ban_nftloglevel} prefix \"banIP/pre-tcp/drop: \""
+		log_ct="log level ${ban_nftloglevel} prefix \"banIP/pre-ct/drop: \""
+	fi
+
 	{
 		# nft header (tables and chains)
 		#
-		printf "%s\n\n" "#!/usr/sbin/nft -f"
+		printf "%s\n\n" "#!${ban_nftcmd} -f"
 		if "${ban_nftcmd}" -t list set inet banIP allowlistv4MAC >/dev/null 2>&1; then
 			printf "%s\n" "delete table inet banIP"
 		fi
 		printf "%s\n" "add table inet banIP"
+		printf "%s\n" "add counter inet banIP cnt-icmpflood"
+		printf "%s\n" "add counter inet banIP cnt-udpflood"
+		printf "%s\n" "add counter inet banIP cnt-synflood"
+		printf "%s\n" "add counter inet banIP cnt-tcpinvalid"
+		printf "%s\n" "add counter inet banIP cnt-ctinvalid"
+		printf "%s\n" "add chain inet banIP pre-routing { type filter hook prerouting priority -150; policy accept; }"
 		printf "%s\n" "add chain inet banIP wan-input { type filter hook input priority ${ban_nftpriority}; policy accept; }"
 		printf "%s\n" "add chain inet banIP wan-forward { type filter hook forward priority ${ban_nftpriority}; policy accept; }"
 		printf "%s\n" "add chain inet banIP lan-forward { type filter hook forward priority ${ban_nftpriority}; policy accept; }"
 		printf "%s\n" "add chain inet banIP reject-chain"
 
-		# default reject rules
+		# default reject chain rules
 		#
 		printf "%s\n" "add rule inet banIP reject-chain meta l4proto tcp reject with tcp reset"
 		printf "%s\n" "add rule inet banIP reject-chain reject"
 
+		# default pre-routing rules
+		#
+		printf "%s\n" "add rule inet banIP pre-routing iifname != { ${wan_dev} } counter accept"
+		printf "%s\n" "add rule inet banIP pre-routing ct state invalid ${log_ct} counter name cnt-ctinvalid drop"
+		if [ "${ban_icmplimit}" -gt "0" ]; then
+			printf "%s\n" "add rule inet banIP pre-routing ip protocol icmp limit rate over ${ban_icmplimit}/second ${log_icmp} counter name cnt-icmpflood drop"
+			printf "%s\n" "add rule inet banIP pre-routing ip6 nexthdr icmpv6 limit rate over ${ban_icmplimit}/second ${log_icmp} counter name cnt-icmpflood drop"
+		fi
+		[ "${ban_udplimit}" -gt "0" ] && printf "%s\n" "add rule inet banIP pre-routing meta l4proto udp ct state new limit rate over ${ban_udplimit}/second ${log_udp} counter name cnt-udpflood drop"
+		[ "${ban_synlimit}" -gt "0" ] && printf "%s\n" "add rule inet banIP pre-routing tcp flags & (fin|syn|rst|ack) == syn limit rate over ${ban_synlimit}/second ${log_syn} counter name cnt-synflood drop"
+		printf "%s\n" "add rule inet banIP pre-routing tcp flags & (fin|syn) == (fin|syn) ${log_tcp} counter name cnt-tcpinvalid drop"
+		printf "%s\n" "add rule inet banIP pre-routing tcp flags & (syn|rst) == (syn|rst) ${log_tcp} counter name cnt-tcpinvalid drop"
+		printf "%s\n" "add rule inet banIP pre-routing tcp flags & (fin|syn|rst|psh|ack|urg) < (fin) ${log_tcp} counter name cnt-tcpinvalid drop"
+		printf "%s\n" "add rule inet banIP pre-routing tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) ${log_tcp} counter name cnt-tcpinvalid drop"
+
 		# default wan-input rules
 		#
-		printf "%s\n" "add rule inet banIP wan-input ct state established,related counter accept"
 		printf "%s\n" "add rule inet banIP wan-input iifname != { ${wan_dev} } counter accept"
+		printf "%s\n" "add rule inet banIP wan-input ct state established,related counter accept"
 		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv4 udp sport 67-68 udp dport 67-68 counter accept"
 		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv6 udp sport 547 udp dport 546 counter accept"
-		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv4 icmp type { echo-request } limit rate 1000/second counter accept"
-		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv6 icmpv6 type { echo-request } limit rate 1000/second counter accept"
-		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv6 icmpv6 type { nd-neighbor-advert, nd-neighbor-solicit, nd-router-advert} limit rate 1000/second ip6 hoplimit 1 counter accept"
-		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv6 icmpv6 type { nd-neighbor-advert, nd-neighbor-solicit, nd-router-advert} limit rate 1000/second ip6 hoplimit 255 counter accept"
+		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv6 icmpv6 type { nd-neighbor-advert, nd-neighbor-solicit, nd-router-advert} ip6 hoplimit 1 counter accept"
+		printf "%s\n" "add rule inet banIP wan-input meta nfproto ipv6 icmpv6 type { nd-neighbor-advert, nd-neighbor-solicit, nd-router-advert} ip6 hoplimit 255 counter accept"
+		[ -n "${allow_dport}" ] && printf "%s\n" "add rule inet banIP wan-input ${allow_dport} counter accept"
 
 		# default wan-forward rules
 		#
-		printf "%s\n" "add rule inet banIP wan-forward ct state established,related counter accept"
 		printf "%s\n" "add rule inet banIP wan-forward iifname != { ${wan_dev} } counter accept"
+		printf "%s\n" "add rule inet banIP wan-forward ct state established,related counter accept"
+		[ -n "${allow_dport}" ] && printf "%s\n" "add rule inet banIP wan-forward ${allow_dport} counter accept"
 
 		# default lan-forward rules
 		#
-		printf "%s\n" "add rule inet banIP lan-forward ct state established,related counter accept"
 		printf "%s\n" "add rule inet banIP lan-forward oifname != { ${wan_dev} } counter accept"
+		printf "%s\n" "add rule inet banIP lan-forward ct state established,related counter accept"
 		[ -n "${vlan_allow}" ] && printf "%s\n" "add rule inet banIP lan-forward iifname { ${vlan_allow} } counter accept"
 		[ -n "${vlan_block}" ] && printf "%s\n" "add rule inet banIP lan-forward iifname { ${vlan_block} } counter goto reject-chain"
 	} >"${file}"
@@ -602,7 +699,14 @@ f_nftinit() {
 	feed_log="$("${ban_nftcmd}" -f "${file}" 2>&1)"
 	feed_rc="${?}"
 
-	f_log "debug" "f_nftinit   ::: wan_dev: ${wan_dev}, vlan_allow: ${vlan_allow:-"-"}, vlan_block: ${vlan_block:-"-"}, priority: ${ban_nftpriority}, policy: ${ban_nftpolicy}, loglevel: ${ban_nftloglevel}, rc: ${feed_rc:-"-"}, log: ${feed_log:-"-"}"
+	if [ "${feed_rc}" = "0" ]; then
+		f_log "info" "initialize banIP nftables namespace"
+	else
+		f_log "err" "can't initialize banIP nftables namespace (rc: ${feed_rc}, log: ${feed_log})"
+	fi
+
+	f_log "debug" "f_nftinit   ::: wan_dev: ${wan_dev}, vlan_allow: ${vlan_allow:-"-"}, vlan_block: ${vlan_block:-"-"}, allowed_dports: ${allow_dport:-"-"}, priority: ${ban_nftpriority}, policy: ${ban_nftpolicy}, icmp_limit: ${ban_icmplimit}, syn_limit: ${ban_synlimit}, udp_limit: ${ban_udplimit}, loglevel: ${ban_nftloglevel}, rc: ${feed_rc:-"-"}, log: ${feed_log:-"-"}"
+	: >"${file}"
 	return "${feed_rc}"
 }
 
@@ -610,7 +714,8 @@ f_nftinit() {
 #
 f_down() {
 	local log_input log_forwardwan log_forwardlan start_ts end_ts tmp_raw tmp_load tmp_file split_file ruleset_raw handle rc etag_rc
-	local cnt_set cnt_dl restore_rc feed_direction feed_rc feed_log feed="${1}" proto="${2}" feed_url="${3}" feed_rule="${4}" feed_flag="${5}"
+	local expr cnt_set cnt_dl restore_rc feed_direction feed_rc feed_log feed_comp feed_target feed_dport tmp_proto tmp_port flag
+	local feed="${1}" proto="${2}" feed_url="${3}" feed_rule="${4}" feed_flag="${5}"
 
 	start_ts="$(date +%s)"
 	feed="${feed}v${proto}"
@@ -625,6 +730,14 @@ f_down() {
 	[ "${ban_loginput}" = "1" ] && log_input="log level ${ban_nftloglevel} prefix \"banIP/inp-wan/${ban_blocktype}/${feed}: \""
 	[ "${ban_logforwardwan}" = "1" ] && log_forwardwan="log level ${ban_nftloglevel} prefix \"banIP/fwd-wan/${ban_blocktype}/${feed}: \""
 	[ "${ban_logforwardlan}" = "1" ] && log_forwardlan="log level ${ban_nftloglevel} prefix \"banIP/fwd-lan/reject/${feed}: \""
+
+	# set feed target
+	#
+	if [ "${ban_blocktype}" = "reject" ]; then
+		feed_target="goto reject-chain"
+	else
+		feed_target="drop"
+	fi
 
 	# set feed block direction
 	#
@@ -657,18 +770,43 @@ f_down() {
 		feed_direction="${feed_direction} forwardlan"
 	fi
 
+	# prepare feed flags
+	#
+	for flag in ${feed_flag}; do
+		if [ "${flag}" = "gz" ]; then
+			feed_comp="${flag}"
+		elif [ "${flag}" = "tcp" ] || [ "${flag}" = "udp" ]; then
+			if [ -z "${tmp_proto}" ]; then
+				tmp_proto="${flag}"
+			elif ! printf "%s" "${tmp_proto}" | "${ban_grepcmd}" -qw "${flag}"; then
+				tmp_proto="${tmp_proto}, ${flag}"
+			fi
+		elif [ -n "${flag//[![:digit:]-]/}" ]; then
+			if [ -z "${tmp_port}" ]; then
+				tmp_port="${flag}"
+			elif ! printf "%s" "${tmp_port}" | "${ban_grepcmd}" -qw "${flag}"; then
+				tmp_port="${tmp_port}, ${flag}"
+			fi
+		fi
+	done
+	if [ -n "${tmp_proto}" ] && [ -n "${tmp_port}" ]; then
+		feed_dport="meta l4proto { ${tmp_proto} } th dport { ${tmp_port} }"
+	fi
+
 	# chain/rule maintenance
 	#
 	if [ "${ban_action}" = "reload" ] && "${ban_nftcmd}" -t list set inet banIP "${feed}" >/dev/null 2>&1; then
 		ruleset_raw="$("${ban_nftcmd}" -tj list ruleset 2>/dev/null)"
 		{
 			printf "%s\n" "flush set inet banIP ${feed}"
-			handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[0].match.right=\"@${feed}\"].handle")"
-			[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-input handle ${handle}"
-			handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[0].match.right=\"@${feed}\"].handle")"
-			[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-forward handle ${handle}"
-			handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[0].match.right=\"@${feed}\"].handle")"
-			[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP lan-forward handle ${handle}"
+			for expr in 0 1; do
+				handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[${expr}].match.right=\"@${feed}\"].handle")"
+				[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-input handle ${handle}"
+				handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[${expr}].match.right=\"@${feed}\"].handle")"
+				[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-forward handle ${handle}"
+				handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[${expr}].match.right=\"@${feed}\"].handle")"
+				[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP lan-forward handle ${handle}"
+			done
 		} >"${tmp_flush}"
 	fi
 
@@ -686,7 +824,7 @@ f_down() {
 				done
 			elif [ "${feed%v*}" = "asn" ]; then
 				for asn in ${ban_asn}; do
-					f_etag "${feed}" "${feed_url}AS${asn}" ".{asn}"
+					f_etag "${feed}" "${feed_url}AS${asn}" ".${asn}"
 					rc="${?}"
 					[ "${rc}" = "4" ] && break
 					etag_rc="$((etag_rc + rc))"
@@ -722,6 +860,7 @@ f_down() {
 				break
 			fi
 		done
+
 		if [ "${feed_rc}" = "0" ]; then
 			f_backup "allowlist" "${tmp_allow}"
 		elif [ -z "${restore_rc}" ] && [ "${feed_rc}" != "0" ]; then
@@ -734,37 +873,29 @@ f_down() {
 	#
 	if [ "${feed%v*}" = "allowlist" ]; then
 		{
-			printf "%s\n\n" "#!/usr/sbin/nft -f"
+			printf "%s\n\n" "#!${ban_nftcmd} -f"
 			[ -s "${tmp_flush}" ] && "${ban_catcmd}" "${tmp_flush}"
 			if [ "${proto}" = "4MAC" ]; then
-				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([0-9]{1,3}\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?[[:space:]]*$|[[:space:]]+$|$)/{if(!$2)$2="0.0.0.0/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${tmp_allow}" >"${tmp_file}"
+				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([1-9][0-9]?[0-9]?\.){1}([0-9]{1,3}\.){2}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?([[:space:]]+#.*$|[[:space:]]*$)|[[:space:]]+#.*$|$)/{if(!$2||$2~/#/)$2="0.0.0.0/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${tmp_allow}" >"${tmp_file}"
 				printf "%s\n" "add set inet banIP ${feed} { type ether_addr . ipv4_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
 				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ether saddr . ip saddr @${feed} counter accept"
 			elif [ "${proto}" = "6MAC" ]; then
-				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([0-9A-f]{0,4}:){1,7}[0-9A-f]{0,4}:?(\/(1?[0-2][0-8]|[0-9][0-9]))?[[:space:]]*$|[[:space:]]+$|$)/{if(!$2)$2="::/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${tmp_allow}" >"${tmp_file}"
+				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([0-9A-f]{0,4}:){1,7}[0-9A-f]{0,4}:?(\/(1?[0-2][0-8]|[0-9][0-9]))?([[:space:]]+#.*$|[[:space:]]*$)|[[:space:]]+#.*$|$)/{if(!$2||$2~/#/)$2="::/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${tmp_allow}" >"${tmp_file}"
 				printf "%s\n" "add set inet banIP ${feed} { type ether_addr . ipv6_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
 				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ether saddr . ip6 saddr @${feed} counter accept"
 			elif [ "${proto}" = "4" ]; then
-				"${ban_awkcmd}" '/^(([0-9]{1,3}\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?)([[:space:]].*|$)/{printf "%s, ",$1}' "${tmp_allow}" >"${tmp_file}"
+				"${ban_awkcmd}" '/^127\./{next}/^(([1-9][0-9]?[0-9]?\.){1}([0-9]{1,3}\.){2}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?)([[:space:]].*|$)/{printf "%s, ",$1}' "${tmp_allow}" >"${tmp_file}"
 				printf "%s\n" "add set inet banIP ${feed} { type ipv4_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
 				if [ -z "${feed_direction##*input*}" ]; then
 					if [ "${ban_allowlistonly}" = "1" ]; then
-						if [ "${ban_blocktype}" = "reject" ]; then
-							printf "%s\n" "add rule inet banIP wan-input ip saddr != @${feed} ${log_input} counter goto reject-chain"
-						else
-							printf "%s\n" "add rule inet banIP wan-input ip saddr != @${feed} ${log_input} counter drop"
-						fi
+						printf "%s\n" "add rule inet banIP wan-input ip saddr != @${feed} ${log_input} counter ${feed_target}"
 					else
 						printf "%s\n" "add rule inet banIP wan-input ip saddr @${feed} counter accept"
 					fi
 				fi
 				if [ -z "${feed_direction##*forwardwan*}" ]; then
 					if [ "${ban_allowlistonly}" = "1" ]; then
-						if [ "${ban_blocktype}" = "reject" ]; then
-							printf "%s\n" "add rule inet banIP wan-forward ip saddr != @${feed} ${log_forwardwan} counter goto reject-chain"
-						else
-							printf "%s\n" "add rule inet banIP wan-forward ip saddr != @${feed} ${log_forwardwan} counter drop"
-						fi
+						printf "%s\n" "add rule inet banIP wan-forward ip saddr != @${feed} ${log_forwardwan} counter ${feed_target}"
 					else
 						printf "%s\n" "add rule inet banIP wan-forward ip saddr @${feed} counter accept"
 					fi
@@ -782,66 +913,54 @@ f_down() {
 				printf "%s\n" "add set inet banIP ${feed} { type ipv6_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
 				if [ -z "${feed_direction##*input*}" ]; then
 					if [ "${ban_allowlistonly}" = "1" ]; then
-						if [ "${ban_blocktype}" = "reject" ]; then
-							printf "%s\n" "add rule inet banIP wan-input ip6 saddr != @${feed} ${log_input} counter goto reject-chain"
-						else
-							printf "%s\n" "add rule inet banIP wan-input ip6 saddr != @${feed} ${log_input} counter drop"
-						fi
+						printf "%s\n" "add rule inet banIP wan-input ip6 saddr != @${feed} ${log_input} counter ${feed_target}"
 					else
 						printf "%s\n" "add rule inet banIP wan-input ip6 saddr @${feed} counter accept"
 					fi
 				fi
 				if [ -z "${feed_direction##*forwardwan*}" ]; then
 					if [ "${ban_allowlistonly}" = "1" ]; then
-						if [ "${ban_blocktype}" = "reject" ]; then
-							printf "%s\n" "add rule inet banIP wan-forward ip6 saddr != @${feed} ${log_forwardwan} counter goto reject-chain"
-						else
-							printf "%s\n" "add rule inet banIP wan-forward ip6 saddr != @${feed} ${log_forwardwan} counter drop"
-						fi
+						printf "%s\n" "add rule inet banIP wan-forward ip6 saddr != @${feed} ${log_forwardwan} counter ${feed_target}"
 					else
 						printf "%s\n" "add rule inet banIP wan-forward ip6 saddr @${feed} counter accept"
 					fi
 				fi
 				if [ -z "${feed_direction##*forwardlan*}" ]; then
 					if [ "${ban_allowlistonly}" = "1" ]; then
-						printf "%s\n" "add rule inet banIP lan-forward ip6 daddr != @${feed} ${log_forwardlan} counter goto reject-chain"
+						printf "%s\n" "add rule inet banIP lan-forward ip6 daddr != @${feed} ${log_forwardlan} counter ${feed_target}"
 					else
 						printf "%s\n" "add rule inet banIP lan-forward ip6 daddr @${feed} counter accept"
 					fi
 				fi
 			fi
 		} >"${tmp_nft}"
+		: >"${tmp_flush}" >"${tmp_raw}" >"${tmp_file}"
 		feed_rc="0"
 	elif [ "${feed%v*}" = "blocklist" ]; then
 		{
-			printf "%s\n\n" "#!/usr/sbin/nft -f"
+			printf "%s\n\n" "#!${ban_nftcmd} -f"
 			[ -s "${tmp_flush}" ] && "${ban_catcmd}" "${tmp_flush}"
 			if [ "${proto}" = "4MAC" ]; then
-				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([0-9]{1,3}\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?[[:space:]]*$|[[:space:]]+$|$)/{if(!$2)$2="0.0.0.0/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${ban_blocklist}" >"${tmp_file}"
+				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([1-9][0-9]?[0-9]?\.){1}([0-9]{1,3}\.){2}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?([[:space:]]+#.*$|[[:space:]]*$)|[[:space:]]+#.*$|$)/{if(!$2||$2~/#/)$2="0.0.0.0/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${ban_blocklist}" >"${tmp_file}"
 				printf "%s\n" "add set inet banIP ${feed} { type ether_addr . ipv4_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
 				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ether saddr . ip saddr @${feed} counter goto reject-chain"
 			elif [ "${proto}" = "6MAC" ]; then
-				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([0-9A-f]{0,4}:){1,7}[0-9A-f]{0,4}:?(\/(1?[0-2][0-8]|[0-9][0-9]))?[[:space:]]*$|[[:space:]]+$|$)/{if(!$2)$2="::/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${ban_blocklist}" >"${tmp_file}"
+				"${ban_awkcmd}" '/^([0-9A-f]{2}:){5}[0-9A-f]{2}(\/([0-9]|[1-3][0-9]|4[0-8]))?([[:space:]]+([0-9A-f]{0,4}:){1,7}[0-9A-f]{0,4}:?(\/(1?[0-2][0-8]|[0-9][0-9]))?([[:space:]]+#.*$|[[:space:]]*$)|[[:space:]]+#.*$|$)/{if(!$2||$2~/#/)$2="::/0";if(!seen[$1]++)printf "%s . %s, ",tolower($1),$2}' "${ban_blocklist}" >"${tmp_file}"
 				printf "%s\n" "add set inet banIP ${feed} { type ether_addr . ipv6_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
 				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ether saddr . ip6 saddr @${feed} counter goto reject-chain"
 			elif [ "${proto}" = "4" ]; then
 				if [ "${ban_deduplicate}" = "1" ]; then
-					"${ban_awkcmd}" '/^(([0-9]{1,3}\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?)([[:space:]].*|$)/{printf "%s,\n",$1}' "${ban_blocklist}" >"${tmp_raw}"
+					"${ban_awkcmd}" '/^127\./{next}/^(([1-9][0-9]?[0-9]?\.){1}([0-9]{1,3}\.){2}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?)([[:space:]].*|$)/{printf "%s,\n",$1}' "${ban_blocklist}" >"${tmp_raw}"
 					"${ban_awkcmd}" 'NR==FNR{member[$0];next}!($0 in member)' "${ban_tmpfile}.deduplicate" "${tmp_raw}" 2>/dev/null >"${tmp_split}"
 					"${ban_awkcmd}" 'BEGIN{FS="[ ,]"}NR==FNR{member[$1];next}!($1 in member)' "${ban_tmpfile}.deduplicate" "${ban_blocklist}" 2>/dev/null >"${tmp_raw}"
 					"${ban_catcmd}" "${tmp_raw}" 2>/dev/null >"${ban_blocklist}"
 				else
-					"${ban_awkcmd}" '/^(([0-9]{1,3}\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?)([[:space:]].*|$)/{printf "%s,\n",$1}' "${ban_blocklist}" >"${tmp_split}"
+					"${ban_awkcmd}" '/^127\./{next}/^(([1-9][0-9]?[0-9]?\.){1}([0-9]{1,3}\.){2}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?)([[:space:]].*|$)/{printf "%s,\n",$1}' "${ban_blocklist}" >"${tmp_split}"
 				fi
 				"${ban_awkcmd}" '{ORS=" ";print}' "${tmp_split}" 2>/dev/null >"${tmp_file}"
 				printf "%s\n" "add set inet banIP ${feed} { type ipv4_addr; flags interval, timeout; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
-				if [ "${ban_blocktype}" = "reject" ]; then
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip saddr @${feed} ${log_input} counter goto reject-chain"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip saddr @${feed} ${log_forwardwan} counter goto reject-chain"
-				else
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip saddr @${feed} ${log_input} counter drop"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip saddr @${feed} ${log_forwardwan} counter drop"
-				fi
+				[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip saddr @${feed} ${log_input} counter ${feed_target}"
+				[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip saddr @${feed} ${log_forwardwan} counter ${feed_target}"
 				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ip daddr @${feed} ${log_forwardlan} counter goto reject-chain"
 			elif [ "${proto}" = "6" ]; then
 				if [ "${ban_deduplicate}" = "1" ]; then
@@ -856,16 +975,12 @@ f_down() {
 				fi
 				"${ban_awkcmd}" '{ORS=" ";print}' "${tmp_split}" 2>/dev/null >"${tmp_file}"
 				printf "%s\n" "add set inet banIP ${feed} { type ipv6_addr; flags interval, timeout; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}") }"
-				if [ "${ban_blocktype}" = "reject" ]; then
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip6 saddr @${feed} ${log_input} counter goto reject-chain"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip6 saddr @${feed} ${log_forwardwan} counter goto reject-chain"
-				else
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip6 saddr @${feed} ${log_input} counter drop"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip6 saddr @${feed} ${log_forwardwan} counter drop"
-				fi
+				[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip6 saddr @${feed} ${log_input} counter ${feed_target}"
+				[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip6 saddr @${feed} ${log_forwardwan} counter ${feed_target}"
 				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ip6 daddr @${feed} ${log_forwardlan} counter goto reject-chain"
 			fi
 		} >"${tmp_nft}"
+		: >"${tmp_flush}" >"${tmp_raw}" >"${tmp_file}"
 		feed_rc="0"
 
 	# handle external feeds
@@ -879,7 +994,7 @@ f_down() {
 				feed_rc="${?}"
 				[ "${feed_rc}" = "0" ] && "${ban_catcmd}" "${tmp_raw}" 2>/dev/null >>"${tmp_load}"
 			done
-			rm -f "${tmp_raw}"
+			: >"${tmp_raw}"
 
 		# handle asn downloads
 		#
@@ -889,19 +1004,15 @@ f_down() {
 				feed_rc="${?}"
 				[ "${feed_rc}" = "0" ] && "${ban_catcmd}" "${tmp_raw}" 2>/dev/null >>"${tmp_load}"
 			done
-			rm -f "${tmp_raw}"
+			: >"${tmp_raw}"
 
 		# handle compressed downloads
 		#
-		elif [ -n "${feed_flag}" ]; then
-			case "${feed_flag}" in
-				"gz")
-					feed_log="$("${ban_fetchcmd}" ${ban_fetchparm} "${tmp_raw}" "${feed_url}" 2>&1)"
-					feed_rc="${?}"
-					[ "${feed_rc}" = "0" ] && "${ban_zcatcmd}" "${tmp_raw}" 2>/dev/null >"${tmp_load}"
-					rm -f "${tmp_raw}"
-					;;
-			esac
+		elif [ "${feed_comp}" = "gz" ]; then
+			feed_log="$("${ban_fetchcmd}" ${ban_fetchparm} "${tmp_raw}" "${feed_url}" 2>&1)"
+			feed_rc="${?}"
+			[ "${feed_rc}" = "0" ] && "${ban_zcatcmd}" "${tmp_raw}" 2>/dev/null >"${tmp_load}"
+			: >"${tmp_raw}"
 
 		# handle normal downloads
 		#
@@ -922,71 +1033,64 @@ f_down() {
 		feed_rc="${?}"
 	fi
 
-	# build nft file with Sets and rules for regular downloads
+	# final file & Set preparation for regular downloads
 	#
 	if [ "${feed_rc}" = "0" ] && [ ! -s "${tmp_nft}" ]; then
 		# deduplicate Sets
 		#
 		if [ "${ban_deduplicate}" = "1" ] && [ "${feed_url}" != "local" ]; then
-			"${ban_awkcmd}" "${feed_rule}" "${tmp_load}" 2>/dev/null >"${tmp_raw}"
+			"${ban_awkcmd}" '{sub("\r$", "");print}' "${tmp_load}" 2>/dev/null | "${ban_awkcmd}" "${feed_rule}" 2>/dev/null >"${tmp_raw}"
 			"${ban_awkcmd}" 'NR==FNR{member[$0];next}!($0 in member)' "${ban_tmpfile}.deduplicate" "${tmp_raw}" 2>/dev/null | tee -a "${ban_tmpfile}.deduplicate" >"${tmp_split}"
+			feed_rc="${?}"
 		else
-			"${ban_awkcmd}" "${feed_rule}" "${tmp_load}" 2>/dev/null >"${tmp_split}"
+			"${ban_awkcmd}" '{sub("\r$", "");print}' "${tmp_load}" 2>/dev/null | "${ban_awkcmd}" "${feed_rule}" 2>/dev/null >"${tmp_split}"
+			feed_rc="${?}"
 		fi
-		feed_rc="${?}"
+		: >"${tmp_raw}" >"${tmp_load}"
+
 		# split Sets
 		#
 		if [ "${feed_rc}" = "0" ]; then
-			if [ -n "${ban_splitsize//[![:digit]]/}" ] && [ "${ban_splitsize//[![:digit]]/}" -gt "0" ]; then
-				if ! "${ban_awkcmd}" "NR%${ban_splitsize//[![:digit]]/}==1{file=\"${tmp_file}.\"++i;}{ORS=\" \";print > file}" "${tmp_split}" 2>/dev/null; then
+			if [ -n "${ban_splitsize//[![:digit:]]/}" ] && [ "${ban_splitsize//[![:digit:]]/}" -ge "512" ]; then
+				if ! "${ban_awkcmd}" "NR%${ban_splitsize//[![:digit:]]/}==1{file=\"${tmp_file}.\"++i;}{ORS=\" \";print > file}" "${tmp_split}" 2>/dev/null; then
+					feed_rc="${?}"
 					rm -f "${tmp_file}".*
-					f_log "info" "can't split Set '${feed}' to size '${ban_splitsize//[![:digit]]/}'"
+					f_log "info" "can't split Set '${feed}' to size '${ban_splitsize//[![:digit:]]/}'"
 				fi
 			else
 				"${ban_awkcmd}" '{ORS=" ";print}' "${tmp_split}" 2>/dev/null >"${tmp_file}.1"
+				feed_rc="${?}"
 			fi
-			feed_rc="${?}"
 		fi
-		rm -f "${tmp_raw}" "${tmp_load}"
-		if [ "${feed_rc}" = "0" ] && [ "${proto}" = "4" ]; then
-			{
-				# nft header (IPv4 Set)
-				#
-				printf "%s\n\n" "#!/usr/sbin/nft -f"
-				[ -s "${tmp_flush}" ] && "${ban_catcmd}" "${tmp_flush}"
-				printf "%s\n" "add set inet banIP ${feed} { type ipv4_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}.1") }"
 
-				# input and forward rules
-				#
-				if [ "${ban_blocktype}" = "reject" ]; then
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip saddr @${feed} ${log_input} counter goto reject-chain"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip saddr @${feed} ${log_forwardwan} counter goto reject-chain"
-				else
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip saddr @${feed} ${log_input} counter drop"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip saddr @${feed} ${log_forwardwan} counter drop"
-				fi
-				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ip daddr @${feed} ${log_forwardlan} counter goto reject-chain"
-			} >"${tmp_nft}"
-		elif [ "${feed_rc}" = "0" ] && [ "${proto}" = "6" ]; then
-			{
-				# nft header (IPv6 Set)
-				#
-				printf "%s\n\n" "#!/usr/sbin/nft -f"
-				[ -s "${tmp_flush}" ] && "${ban_catcmd}" "${tmp_flush}"
-				printf "%s\n" "add set inet banIP ${feed} { type ipv6_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}.1") }"
-
-				# input and forward rules
-				#
-				if [ "${ban_blocktype}" = "reject" ]; then
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip6 saddr @${feed} ${log_input} counter goto reject-chain"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip6 saddr @${feed} ${log_forwardwan} counter goto reject-chain"
-				else
-					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ip6 saddr @${feed} ${log_input} counter drop"
-					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ip6 saddr @${feed} ${log_forwardwan} counter drop"
-				fi
-				[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ip6 daddr @${feed} ${log_forwardlan} counter goto reject-chain"
-			} >"${tmp_nft}"
+		# build nft file
+		#
+		if [ "${feed_rc}" = "0" ] && [ -s "${tmp_file}.1" ]; then
+			if [ "${proto}" = "4" ]; then
+				{
+					# nft header (IPv4 Set) input and forward rules
+					#
+					printf "%s\n\n" "#!${ban_nftcmd} -f"
+					[ -s "${tmp_flush}" ] && "${ban_catcmd}" "${tmp_flush}"
+					printf "%s\n" "add set inet banIP ${feed} { type ipv4_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}.1") }"
+					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ${feed_dport} ip saddr @${feed} ${log_input} counter ${feed_target}"
+					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ${feed_dport} ip saddr @${feed} ${log_forwardwan} counter ${feed_target}"
+					[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ${feed_dport} ip daddr @${feed} ${log_forwardlan} counter goto reject-chain"
+				} >"${tmp_nft}"
+			elif [ "${proto}" = "6" ]; then
+				{
+					# nft header (IPv6 Set) plus input and forward rules
+					#
+					printf "%s\n\n" "#!${ban_nftcmd} -f"
+					[ -s "${tmp_flush}" ] && "${ban_catcmd}" "${tmp_flush}"
+					printf "%s\n" "add set inet banIP ${feed} { type ipv6_addr; flags interval; auto-merge; policy ${ban_nftpolicy}; $(f_getelements "${tmp_file}.1") }"
+					[ -z "${feed_direction##*input*}" ] && printf "%s\n" "add rule inet banIP wan-input ${feed_dport} ip6 saddr @${feed} ${log_input} counter ${feed_target}"
+					[ -z "${feed_direction##*forwardwan*}" ] && printf "%s\n" "add rule inet banIP wan-forward ${feed_dport} ip6 saddr @${feed} ${log_forwardwan} counter ${feed_target}"
+					[ -z "${feed_direction##*forwardlan*}" ] && printf "%s\n" "add rule inet banIP lan-forward ${feed_dport} ip6 daddr @${feed} ${log_forwardlan} counter goto reject-chain"
+				} >"${tmp_nft}"
+			fi
 		fi
+		: >"${tmp_flush}" >"${tmp_file}.1"
 	fi
 
 	# load generated nft file in banIP table
@@ -996,6 +1100,7 @@ f_down() {
 			cnt_dl="$("${ban_awkcmd}" 'END{printf "%d",NR}' "${tmp_allow}" 2>/dev/null)"
 		else
 			cnt_dl="$("${ban_awkcmd}" 'END{printf "%d",NR}' "${tmp_split}" 2>/dev/null)"
+			: >"${tmp_split}"
 		fi
 		if [ "${cnt_dl:-"0"}" -gt "0" ] || [ "${feed_url}" = "local" ] || [ "${feed%v*}" = "allowlist" ] || [ "${feed%v*}" = "blocklist" ]; then
 			feed_log="$("${ban_nftcmd}" -f "${tmp_nft}" 2>&1)"
@@ -1005,25 +1110,26 @@ f_down() {
 			#
 			if [ "${feed_rc}" = "0" ]; then
 				for split_file in "${tmp_file}".*; do
-					[ ! -f "${split_file}" ] && break
-					if [ "${split_file##*.}" = "1" ]; then
-						rm -f "${split_file}"
-						continue
+					if [ -s "${split_file}" ]; then
+						"${ban_sedcmd}" -i "1 i #!${ban_nftcmd} -f\nadd element inet banIP "${feed}" { " "${split_file}"
+						printf "%s\n" "}" >>"${split_file}"
+						if ! "${ban_nftcmd}" -f "${split_file}" >/dev/null 2>&1; then
+							f_log "info" "can't add split file '${split_file##*.}' to Set '${feed}'"
+						fi
+						: >"${split_file}"
 					fi
-					if ! "${ban_nftcmd}" add element inet banIP "${feed}" "{ $("${ban_catcmd}" "${split_file}") }" >/dev/null 2>&1; then
-						f_log "info" "can't add split file '${split_file##*.}' to Set '${feed}'"
-					fi
-					rm -f "${split_file}"
 				done
 				if [ "${ban_debug}" = "1" ] && [ "${ban_reportelements}" = "1" ]; then
 					cnt_set="$("${ban_nftcmd}" -j list set inet banIP "${feed}" 2>/dev/null | "${ban_jsoncmd}" -qe '@.nftables[*].set.elem[*]' | wc -l 2>/dev/null)"
 				fi
+			else
+				f_log "info" "can't initialize Set for feed '${feed}' (rc: ${feed_rc}, log: ${feed_log})"
 			fi
 		else
 			f_log "info" "skip empty feed '${feed}'"
 		fi
 	fi
-	rm -f "${tmp_split}" "${tmp_nft}"
+	: >"${tmp_nft}"
 	end_ts="$(date +%s)"
 
 	f_log "debug" "f_down      ::: feed: ${feed}, cnt_dl: ${cnt_dl:-"-"}, cnt_set: ${cnt_set:-"-"}, split_size: ${ban_splitsize:-"-"}, time: $((end_ts - start_ts)), rc: ${feed_rc:-"-"}, log: ${feed_log:-"-"}"
@@ -1035,7 +1141,7 @@ f_backup() {
 	local backup_rc="4" feed="${1}" feed_file="${2}"
 
 	if [ -s "${feed_file}" ]; then
-		gzip -cf "${feed_file}" >"${ban_backupdir}/banIP.${feed}.gz"
+		"${ban_gzipcmd}" -cf "${feed_file}" >"${ban_backupdir}/banIP.${feed}.gz"
 		backup_rc="${?}"
 	fi
 
@@ -1061,46 +1167,50 @@ f_restore() {
 # remove disabled Sets
 #
 f_rmset() {
-	local feedlist tmp_del ruleset_raw item table_sets handle del_set feed_log feed_rc
+	local expr feedlist tmp_del ruleset_raw item table_sets handle del_set feed_log feed_rc
 
 	f_getfeed
 	json_get_keys feedlist
 	tmp_del="${ban_tmpfile}.final.delete"
 	ruleset_raw="$("${ban_nftcmd}" -tj list ruleset 2>/dev/null)"
-	table_sets="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.set.table="banIP"].set.name')"
+	table_sets="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.set.table="banIP"&&@.set.family="inet"].set.name')"
 	{
-		printf "%s\n\n" "#!/usr/sbin/nft -f"
+		printf "%s\n\n" "#!${ban_nftcmd} -f"
 		for item in ${table_sets}; do
 			if ! printf "%s" "allowlist blocklist ${ban_feed}" | "${ban_grepcmd}" -q "${item%v*}" ||
 				! printf "%s" "allowlist blocklist ${feedlist}" | "${ban_grepcmd}" -q "${item%v*}"; then
-				del_set="${del_set}${item}, "
+				[ -z "${del_set}" ] && del_set="${item}" || del_set="${del_set}, ${item}"
 				rm -f "${ban_backupdir}/banIP.${item}.gz"
 				printf "%s\n" "flush set inet banIP ${item}"
-				handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[0].match.right=\"@${item}\"].handle")"
-				[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-input handle ${handle}"
-				handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[0].match.right=\"@${item}\"].handle")"
-				[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-forward handle ${handle}"
-				handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[0].match.right=\"@${item}\"].handle")"
-				[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP lan-forward handle ${handle}"
+				for expr in 0 1; do
+					handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[${expr}].match.right=\"@${item}\"].handle")"
+					[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-input handle ${handle}"
+					handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].handle")"
+					[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP wan-forward handle ${handle}"
+					handle="$(printf "%s\n" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].handle")"
+					[ -n "${handle}" ] && printf "%s\n" "delete rule inet banIP lan-forward handle ${handle}"
+				done
 				printf "%s\n\n" "delete set inet banIP ${item}"
 			fi
 		done
 	} >"${tmp_del}"
 
 	if [ -n "${del_set}" ]; then
-		del_set="${del_set%%??}"
 		feed_log="$("${ban_nftcmd}" -f "${tmp_del}" 2>&1)"
 		feed_rc="${?}"
 	fi
-	rm -f "${tmp_del}"
+	: >"${tmp_del}"
 
-	f_log "debug" "f_rmset     ::: sets: ${del_set:-"-"}, rc: ${feed_rc:-"-"}, log: ${feed_log:-"-"}"
+	f_log "debug" "f_rmset     ::: Set: ${del_set:-"-"}, rc: ${feed_rc:-"-"}, log: ${feed_log:-"-"}"
 }
 
 # generate status information
 #
 f_genstatus() {
-	local object end_time duration table_sets cnt_elements="0" custom_feed="0" split="0" status="${1}"
+	local mem_free mem_max object end_time duration table_sets cnt_elements="0" custom_feed="0" split="0" status="${1}"
+
+	mem_free="$("${ban_awkcmd}" '/^MemAvailable/{printf "%s",int($2/1024)}' "/proc/meminfo" 2>/dev/null)"
+	mem_max="$("${ban_awkcmd}" '/^VmHWM/{printf "%s",int($2)}' /proc/${$}/status 2>/dev/null)"
 
 	[ -z "${ban_dev}" ] && f_conf
 	if [ "${status}" = "active" ]; then
@@ -1108,13 +1218,13 @@ f_genstatus() {
 			end_time="$(date "+%s")"
 			duration="$(((end_time - ban_starttime) / 60))m $(((end_time - ban_starttime) % 60))s"
 		fi
-		table_sets="$("${ban_nftcmd}" -tj list ruleset 2>/dev/null | "${ban_jsoncmd}" -qe '@.nftables[@.set.table="banIP"].set.name')"
+		table_sets="$("${ban_nftcmd}" -tj list ruleset 2>/dev/null | "${ban_jsoncmd}" -qe '@.nftables[@.set.table="banIP"&&@.set.family="inet"].set.name')"
 		if [ "${ban_reportelements}" = "1" ]; then
 			for object in ${table_sets}; do
 				cnt_elements="$((cnt_elements + $("${ban_nftcmd}" -j list set inet banIP "${object}" 2>/dev/null | "${ban_jsoncmd}" -qe '@.nftables[*].set.elem[*]' | wc -l 2>/dev/null)))"
 			done
 		fi
-		runtime="action: ${ban_action:-"-"}, log: ${ban_logreadcmd##*/}, fetch: ${ban_fetchcmd##*/}, duration: ${duration:-"-"}, date: $(date "+%Y-%m-%d %H:%M:%S")"
+		runtime="mode: ${ban_action:-"-"}, period: ${duration:-"-"}, memory: ${mem_free} MB available, ${mem_max} KB max. used, cores: ${ban_cores}, log: ${ban_logreadcmd##*/}, fetch: ${ban_fetchcmd##*/}"
 	fi
 	[ -s "${ban_customfeedfile}" ] && custom_feed="1"
 	[ "${ban_splitsize:-"0"}" -gt "0" ] && split="1"
@@ -1155,11 +1265,11 @@ f_genstatus() {
 		json_add_string "${object}" "${object}"
 	done
 	json_close_array
-	json_add_string "nft_info" "priority: ${ban_nftpriority}, policy: ${ban_nftpolicy}, loglevel: ${ban_nftloglevel}, expiry: ${ban_nftexpiry:-"-"}"
+	json_add_string "nft_info" "priority: ${ban_nftpriority}, policy: ${ban_nftpolicy}, loglevel: ${ban_nftloglevel}, expiry: ${ban_nftexpiry:-"-"}, limit (icmp/syn/udp): ${ban_icmplimit}/${ban_synlimit}/${ban_udplimit}"
 	json_add_string "run_info" "base: ${ban_basedir}, backup: ${ban_backupdir}, report: ${ban_reportdir}"
-	json_add_string "run_flags" "auto: $(f_char ${ban_autodetect}), proto (4/6): $(f_char ${ban_protov4})/$(f_char ${ban_protov6}), log (wan-inp/wan-fwd/lan-fwd): $(f_char ${ban_loginput})/$(f_char ${ban_logforwardwan})/$(f_char ${ban_logforwardlan}), dedup: $(f_char ${ban_deduplicate}), split: $(f_char ${split}), custom feed: $(f_char ${custom_feed}), allowed only: $(f_char ${ban_allowlistonly})"
+	json_add_string "run_flags" "auto: $(f_char ${ban_autodetect}), proto (4/6): $(f_char ${ban_protov4})/$(f_char ${ban_protov6}), log (pre/inp/fwd/lan): $(f_char ${ban_logprerouting})/$(f_char ${ban_loginput})/$(f_char ${ban_logforwardwan})/$(f_char ${ban_logforwardlan}), dedup: $(f_char ${ban_deduplicate}), split: $(f_char ${split}), custom feed: $(f_char ${custom_feed}), allowed only: $(f_char ${ban_allowlistonly})"
 	json_add_string "last_run" "${runtime:-"-"}"
-	json_add_string "system_info" "cores: ${ban_cores}, memory: ${ban_memory}, device: ${ban_sysver}"
+	json_add_string "system_info" "$(date "+%Y-%m-%d %H:%M:%S"), ${ban_sysver}"
 	json_dump >"${ban_rtfile}"
 }
 
@@ -1189,7 +1299,7 @@ f_getstatus() {
 			else
 				json_get_var value "${key}" >/dev/null 2>&1
 				if [ "${key}" = "status" ]; then
-					value="${value} ($(f_actual))"
+					[ "${value}" = "active" ] && value="${value} ($(f_actual))" || value="${value}"
 				fi
 			fi
 			if [ "${key}" != "wan_interfaces" ] && [ "${key}" != "vlan_allow" ] && [ "${key}" != "vlan_block" ]; then
@@ -1217,48 +1327,42 @@ f_lookup() {
 	for domain in ${list}; do
 		lookup="$("${ban_lookupcmd}" "${domain}" ${ban_resolver} 2>/dev/null | "${ban_awkcmd}" '/^Address[ 0-9]*: /{if(!seen[$NF]++)printf "%s ",$NF}' 2>/dev/null)"
 		for ip in ${lookup}; do
-			if [ "${ip%%.*}" = "0" ] || [ -z "${ip%%::*}" ]; then
+			if [ "${ip%%.*}" = "127" ] || [ "${ip%%.*}" = "0" ] || [ -z "${ip%%::*}" ]; then
 				continue
 			else
-				if { [ "${feed}" = "allowlist" ] && ! "${ban_grepcmd}" -q "^${ip}" "${ban_allowlist}"; } ||
-					{ [ "${feed}" = "blocklist" ] && ! "${ban_grepcmd}" -q "^${ip}" "${ban_blocklist}"; }; then
-					if [ "${ip##*:}" = "${ip}" ]; then
-						elementsv4="${elementsv4} ${ip},"
-					else
-						elementsv6="${elementsv6} ${ip},"
-					fi
-					if [ "${feed}" = "allowlist" ] && [ "${ban_autoallowlist}" = "1" ]; then
-						printf "%-42s%s\n" "${ip}" "# '${domain}' added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_allowlist}"
-					elif [ "${feed}" = "blocklist" ] && [ "${ban_autoblocklist}" = "1" ]; then
-						printf "%-42s%s\n" "${ip}" "# '${domain}' added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_blocklist}"
-					fi
-					cnt_ip="$((cnt_ip + 1))"
+				[ "${ip##*:}" = "${ip}" ] && elementsv4="${elementsv4} ${ip}," || elementsv6="${elementsv6} ${ip},"
+				if [ "${feed}" = "allowlist" ] && [ "${ban_autoallowlist}" = "1" ] && ! "${ban_grepcmd}" -q "^${ip}[[:space:]]*#" "${ban_allowlist}"; then
+					printf "%-45s%s\n" "${ip}" "# '${domain}' added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_allowlist}"
+				elif [ "${feed}" = "blocklist" ] && [ "${ban_autoblocklist}" = "1" ] && ! "${ban_grepcmd}" -q "^${ip}[[:space:]]*#" "${ban_blocklist}"; then
+					printf "%-45s%s\n" "${ip}" "# '${domain}' added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_blocklist}"
 				fi
+				cnt_ip="$((cnt_ip + 1))"
 			fi
 		done
 		cnt_domain="$((cnt_domain + 1))"
 	done
 	if [ -n "${elementsv4}" ]; then
-		if ! "${ban_nftcmd}" add element inet banIP "${feed}v4" "{ ${elementsv4} }" >/dev/null 2>&1; then
+		if ! "${ban_nftcmd}" add element inet banIP "${feed}v4" { ${elementsv4} } >/dev/null 2>&1; then
 			f_log "info" "can't add lookup file to Set '${feed}v4'"
 		fi
 	fi
 	if [ -n "${elementsv6}" ]; then
-		if ! "${ban_nftcmd}" add element inet banIP "${feed}v6" "{ ${elementsv6} }" >/dev/null 2>&1; then
+		if ! "${ban_nftcmd}" add element inet banIP "${feed}v6" { ${elementsv6} } >/dev/null 2>&1; then
 			f_log "info" "can't add lookup file to Set '${feed}v6'"
 		fi
 	fi
 	end_time="$(date "+%s")"
 	duration="$(((end_time - start_time) / 60))m $(((end_time - start_time) % 60))s"
 
-	f_log "debug" "f_lookup    ::: feed: ${feed}, domains: ${cnt_domain}, IPs: ${cnt_ip}, duration: ${duration}"
+	f_log "info" "domain lookup finished in ${duration} (${feed}, ${cnt_domain} domains, ${cnt_ip} IPs)"
 }
 
 # table statistics
 #
 f_report() {
-	local report_jsn report_txt tmp_val ruleset_raw item table_sets set_cnt set_input set_forwardwan set_forwardlan set_cntinput set_cntforwardwan set_cntforwardlan output="${1}"
-	local detail set_details jsnval timestamp autoadd_allow autoadd_block sum_sets sum_setinput sum_setforwardwan sum_setforwardlan sum_setelements sum_cntinput sum_cntforwardwan sum_cntforwardlan
+	local report_jsn report_txt tmp_val ruleset_raw item table_sets set_cnt set_input set_forwardwan set_forwardlan set_cntinput set_cntforwardwan set_cntforwardlan set_proto set_dport set_details
+	local expr detail jsnval timestamp autoadd_allow autoadd_block sum_sets sum_setinput sum_setforwardwan sum_setforwardlan sum_setelements sum_cntinput sum_cntforwardwan sum_cntforwardlan
+	local sum_synflood sum_udpflood sum_icmpflood sum_ctinvalid sum_tcpinvalid output="${1}"
 
 	[ -z "${ban_dev}" ] && f_conf
 	f_mkdir "${ban_reportdir}"
@@ -1268,7 +1372,7 @@ f_report() {
 	# json output preparation
 	#
 	ruleset_raw="$("${ban_nftcmd}" -tj list ruleset 2>/dev/null)"
-	table_sets="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.set.table="banIP"].set.name')"
+	table_sets="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.set.table="banIP"&&@.set.family="inet"].set.name')"
 	sum_sets="0"
 	sum_setinput="0"
 	sum_setforwardwan="0"
@@ -1277,15 +1381,33 @@ f_report() {
 	sum_cntinput="0"
 	sum_cntforwardwan="0"
 	sum_cntforwardlan="0"
+	sum_synflood="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.counter.name="cnt-synflood"].*.packets')"
+	sum_udpflood="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.counter.name="cnt-udpflood"].*.packets')"
+	sum_icmpflood="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.counter.name="cnt-icmpflood"].*.packets')"
+	sum_ctinvalid="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.counter.name="cnt-ctinvalid"].*.packets')"
+	sum_tcpinvalid="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -qe '@.nftables[@.counter.name="cnt-tcpinvalid"].*.packets')"
 	timestamp="$(date "+%Y-%m-%d %H:%M:%S")"
 	: >"${report_jsn}"
 	{
 		printf "%s\n" "{"
 		printf "\t%s\n" '"sets":{'
 		for item in ${table_sets}; do
-			set_cntinput="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[0].match.right=\"@${item}\"].expr[*].counter.packets")"
-			set_cntforwardwan="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[0].match.right=\"@${item}\"].expr[*].counter.packets")"
-			set_cntforwardlan="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[0].match.right=\"@${item}\"].expr[*].counter.packets")"
+			set_cntinput=""
+			set_cntforwardwan=""
+			set_cntforwardlan=""
+			set_proto=""
+			set_dport=""
+			for expr in 0 1; do
+				[ -z "${set_cntinput}" ] && set_cntinput="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].counter.packets")"
+				[ "${expr}" = "1" ] && [ -z "${set_dport}" ] && set_dport="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].match.right.set")"
+				[ "${expr}" = "1" ] && [ -z "${set_proto}" ] && set_proto="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-input\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].match.left.payload.protocol")"
+				[ -z "${set_cntforwardwan}" ] && set_cntforwardwan="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].counter.packets")"
+				[ "${expr}" = "1" ] && [ -z "${set_dport}" ] && set_dport="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].match.right.set")"
+				[ "${expr}" = "1" ] && [ -z "${set_proto}" ] && set_proto="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"wan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].match.left.payload.protocol")"
+				[ -z "${set_cntforwardlan}" ] && set_cntforwardlan="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].counter.packets")"
+				[ "${expr}" = "1" ] && [ -z "${set_dport}" ] && set_dport="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].match.right.set")"
+				[ "${expr}" = "1" ] && [ -z "${set_proto}" ] && set_proto="$(printf "%s" "${ruleset_raw}" | "${ban_jsoncmd}" -ql1 -e "@.nftables[@.rule.table=\"banIP\"&&@.rule.chain=\"lan-forward\"][@.expr[${expr}].match.right=\"@${item}\"].expr[*].match.left.payload.protocol")"
+			done
 			if [ "${ban_reportelements}" = "1" ]; then
 				set_cnt="$("${ban_nftcmd}" -j list set inet banIP "${item}" 2>/dev/null | "${ban_jsoncmd}" -qe '@.nftables[*].set.elem[*]' | wc -l 2>/dev/null)"
 				sum_setelements="$((sum_setelements + set_cnt))"
@@ -1293,8 +1415,14 @@ f_report() {
 				set_cnt=""
 				sum_setelements="n/a"
 			fi
+			if [ -n "${set_dport}" ]; then
+				set_dport="${set_dport//[\{\}\":]/}"
+				set_dport="${set_dport#\[ *}"
+				set_dport="${set_dport%* \]}"
+				set_dport="${set_proto}: $(f_trim "${set_dport}")"
+			fi
 			if [ -n "${set_cntinput}" ]; then
-				set_input="OK"
+				set_input="ON"
 				sum_setinput="$((sum_setinput + 1))"
 				sum_cntinput="$((sum_cntinput + set_cntinput))"
 			else
@@ -1302,7 +1430,7 @@ f_report() {
 				set_cntinput=""
 			fi
 			if [ -n "${set_cntforwardwan}" ]; then
-				set_forwardwan="OK"
+				set_forwardwan="ON"
 				sum_setforwardwan="$((sum_setforwardwan + 1))"
 				sum_cntforwardwan="$((sum_cntforwardwan + set_cntforwardwan))"
 			else
@@ -1310,7 +1438,7 @@ f_report() {
 				set_cntforwardwan=""
 			fi
 			if [ -n "${set_cntforwardlan}" ]; then
-				set_forwardlan="OK"
+				set_forwardlan="ON"
 				sum_setforwardlan="$((sum_setforwardlan + 1))"
 				sum_cntforwardlan="$((sum_cntforwardlan + set_cntforwardlan))"
 			else
@@ -1325,7 +1453,8 @@ f_report() {
 			printf "\t\t\t%s\n" "\"cnt_forwardwan\": \"${set_cntforwardwan}\","
 			printf "\t\t\t%s\n" "\"wan_forward\": \"${set_forwardwan}\","
 			printf "\t\t\t%s\n" "\"cnt_forwardlan\": \"${set_cntforwardlan}\","
-			printf "\t\t\t%s\n" "\"lan_forward\": \"${set_forwardlan}\""
+			printf "\t\t\t%s\n" "\"lan_forward\": \"${set_forwardlan}\"",
+			printf "\t\t\t%s\n" "\"port\": \"${set_dport:-"-"}\""
 			printf "\t\t%s" "}"
 			sum_sets="$((sum_sets + 1))"
 		done
@@ -1333,6 +1462,11 @@ f_report() {
 		printf "\t%s\n" "\"timestamp\": \"${timestamp}\","
 		printf "\t%s\n" "\"autoadd_allow\": \"$("${ban_grepcmd}" -c "added on ${timestamp% *}" "${ban_allowlist}")\","
 		printf "\t%s\n" "\"autoadd_block\": \"$("${ban_grepcmd}" -c "added on ${timestamp% *}" "${ban_blocklist}")\","
+		printf "\t%s\n" "\"sum_synflood\": \"${sum_synflood}\","
+		printf "\t%s\n" "\"sum_udpflood\": \"${sum_udpflood}\","
+		printf "\t%s\n" "\"sum_icmpflood\": \"${sum_icmpflood}\","
+		printf "\t%s\n" "\"sum_ctinvalid\": \"${sum_ctinvalid}\","
+		printf "\t%s\n" "\"sum_tcpinvalid\": \"${sum_tcpinvalid}\","
 		printf "\t%s\n" "\"sum_sets\": \"${sum_sets}\","
 		printf "\t%s\n" "\"sum_setinput\": \"${sum_setinput}\","
 		printf "\t%s\n" "\"sum_setforwardwan\": \"${sum_setforwardwan}\","
@@ -1353,6 +1487,11 @@ f_report() {
 			json_get_var timestamp "timestamp" >/dev/null 2>&1
 			json_get_var autoadd_allow "autoadd_allow" >/dev/null 2>&1
 			json_get_var autoadd_block "autoadd_block" >/dev/null 2>&1
+			json_get_var sum_synflood "sum_synflood" >/dev/null 2>&1
+			json_get_var sum_udpflood "sum_udpflood" >/dev/null 2>&1
+			json_get_var sum_icmpflood "sum_icmpflood" >/dev/null 2>&1
+			json_get_var sum_ctinvalid "sum_ctinvalid" >/dev/null 2>&1
+			json_get_var sum_tcpinvalid "sum_tcpinvalid" >/dev/null 2>&1
 			json_get_var sum_sets "sum_sets" >/dev/null 2>&1
 			json_get_var sum_setinput "sum_setinput" >/dev/null 2>&1
 			json_get_var sum_setforwardwan "sum_setforwardwan" >/dev/null 2>&1
@@ -1365,13 +1504,19 @@ f_report() {
 				printf "%s\n%s\n%s\n" ":::" "::: banIP Set Statistics" ":::"
 				printf "%s\n" "    Timestamp: ${timestamp}"
 				printf "%s\n" "    ------------------------------"
-				printf "%s\n" "    auto-added to allowlist today: ${autoadd_allow}"
-				printf "%s\n\n" "    auto-added to blocklist today: ${autoadd_block}"
+				printf "%s\n" "    blocked syn-flood packets  : ${sum_synflood}"
+				printf "%s\n" "    blocked udp-flood packets  : ${sum_udpflood}"
+				printf "%s\n" "    blocked icmp-flood packets : ${sum_icmpflood}"
+				printf "%s\n" "    blocked invalid ct packets : ${sum_ctinvalid}"
+				printf "%s\n" "    blocked invalid tcp packets: ${sum_tcpinvalid}"
+				printf "%s\n" "    ---"
+				printf "%s\n" "    auto-added IPs to allowlist: ${autoadd_allow}"
+				printf "%s\n\n" "    auto-added IPs to blocklist: ${autoadd_block}"
 				json_select "sets" >/dev/null 2>&1
 				json_get_keys table_sets >/dev/null 2>&1
 				if [ -n "${table_sets}" ]; then
-					printf "%-25s%-15s%-24s%-24s%s\n" "    Set" "| Elements" "| WAN-Input (packets)" "| WAN-Forward (packets)" "| LAN-Forward (packets)"
-					printf "%s\n" "    ---------------------+--------------+-----------------------+-----------------------+------------------------"
+					printf "%-25s%-15s%-24s%-24s%-24s%s\n" "    Set" "| Elements" "| WAN-Input (packets)" "| WAN-Forward (packets)" "| LAN-Forward (packets)" "| Port/Protocol Limit"
+					printf "%s\n" "    ---------------------+--------------+-----------------------+-----------------------+-----------------------+------------------------"
 					for item in ${table_sets}; do
 						printf "    %-21s" "${item}"
 						json_select "${item}"
@@ -1394,7 +1539,7 @@ f_report() {
 						printf "\n"
 						json_select ".."
 					done
-					printf "%s\n" "    ---------------------+--------------+-----------------------+-----------------------+------------------------"
+					printf "%s\n" "    ---------------------+--------------+-----------------------+-----------------------+-----------------------+------------------------"
 					printf "%-25s%-15s%-24s%-24s%s\n" "    ${sum_sets}" "| ${sum_setelements}" "| ${sum_setinput} (${sum_cntinput})" "| ${sum_setforwardwan} (${sum_cntforwardwan})" "| ${sum_setforwardlan} (${sum_cntforwardlan})"
 				fi
 			} >>"${report_txt}"
@@ -1414,7 +1559,7 @@ f_report() {
 			[ -n "${ban_mailreceiver}" ] && [ -x "${ban_mailcmd}" ] && f_mail
 			;;
 	esac
-	rm -f "${report_txt}"
+	: >"${report_txt}"
 }
 
 # Set search
@@ -1423,10 +1568,10 @@ f_search() {
 	local item table_sets ip proto hold cnt result_flag="/var/run/banIP.search" input="${1}"
 
 	if [ -n "${input}" ]; then
-		ip="$(printf "%s" "${input}" | "${ban_awkcmd}" 'BEGIN{RS="(([0-9]{1,3}\\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\/(1?[0-9]|2?[0-9]|3?[0-2]))?[[:space:]]*$)"}{printf "%s",RT}')"
+		ip="$(printf "%s" "${input}" | "${ban_awkcmd}" 'BEGIN{RS="(([1-9][0-9]{0,2}\\.){1}([0-9]{1,3}\\.){2}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])(\\/(1?[0-9]|2?[0-9]|3?[0-2]))?[[:space:]]*$)"}{printf "%s",RT}')"
 		[ -n "${ip}" ] && proto="v4"
 		if [ -z "${proto}" ]; then
-			ip="$(printf "%s" "${input}" | "${ban_awkcmd}" 'BEGIN{RS="(([0-9A-f]{0,4}:){1,7}[0-9A-f]{0,4}:?(\/(1?[0-2][0-8]|[0-9][0-9]))?)([[:space:]].*|$)"}{printf "%s",RT}')"
+			ip="$(printf "%s" "${input}" | "${ban_awkcmd}" 'BEGIN{RS="(([0-9A-f]{0,4}:){1,7}[0-9A-f]{0,4}:?(\\/(1?[0-2][0-8]|[0-9][0-9]))?)([[:space:]].*|$)"}{printf "%s",RT}')"
 			[ -n "${ip}" ] && proto="v6"
 		fi
 	fi
@@ -1436,14 +1581,14 @@ f_search() {
 		printf "%s\n%s\n%s\n" ":::" "::: no valid search input" ":::"
 		return
 	fi
-	printf "%s\n%s\n%s\n" ":::" "::: banIP Search" ":::"
-	printf "    %s\n" "Looking for IP '${ip}' on $(date "+%Y-%m-%d %H:%M:%S")"
-	printf "    %s\n" "---"
 	cnt="1"
 	for item in ${table_sets}; do
 		[ -f "${result_flag}" ] && break
 		(
 			if "${ban_nftcmd}" get element inet banIP "${item}" "{ ${ip} }" >/dev/null 2>&1; then
+				printf "%s\n%s\n%s\n" ":::" "::: banIP Search" ":::"
+				printf "    %s\n" "Looking for IP '${ip}' on $(date "+%Y-%m-%d %H:%M:%S")"
+				printf "    %s\n" "---"
 				printf "    %s\n" "IP found in Set '${item}'"
 				: >"${result_flag}"
 			fi
@@ -1453,7 +1598,14 @@ f_search() {
 		cnt="$((cnt + 1))"
 	done
 	wait
-	[ -f "${result_flag}" ] && rm -f "${result_flag}" || printf "    %s\n" "IP not found"
+	if [ -f "${result_flag}" ]; then
+		rm -f "${result_flag}"
+	else
+		printf "%s\n%s\n%s\n" ":::" "::: banIP Search" ":::"
+		printf "    %s\n" "Looking for IP '${ip}' on $(date "+%Y-%m-%d %H:%M:%S")"
+		printf "    %s\n" "---"
+		printf "    %s\n" "IP not found"
+	fi
 }
 
 # Set survey
@@ -1499,12 +1651,12 @@ f_mail() {
 # log monitor
 #
 f_monitor() {
-	local logread_cmd loglimit_cmd nft_expiry line proto ip log_raw log_count rdap_log rdap_rc rdap_elements rdap_info
+	local daemon logread_cmd loglimit_cmd nft_expiry line proto ip log_raw log_count idx prefix cidr rdap_log rdap_rc rdap_idx rdap_info
 
 	if [ -f "${ban_logreadfile}" ]; then
 		logread_cmd="${ban_logreadcmd} -qf ${ban_logreadfile} 2>/dev/null | ${ban_grepcmd} -e \"${ban_logterm%%??}\" 2>/dev/null"
 		loglimit_cmd="${ban_logreadcmd} -qn ${ban_loglimit} ${ban_logreadfile} 2>/dev/null"
-	elif printf "%s" "${ban_packages}" | "${ban_grepcmd}" -q '"logd'; then
+	else
 		logread_cmd="${ban_logreadcmd} -fe \"${ban_logterm%%??}\" 2>/dev/null"
 		loglimit_cmd="${ban_logreadcmd} -l ${ban_loglimit} 2>/dev/null"
 	fi
@@ -1514,45 +1666,61 @@ f_monitor() {
 		[ -n "${ban_nftexpiry}" ] && nft_expiry="timeout $(printf "%s" "${ban_nftexpiry}" | "${ban_grepcmd}" -oE "([0-9]+[d|h|m|s])+$")"
 		eval "${logread_cmd}" |
 			while read -r line; do
-				: >"${ban_rdapfile}"
 				proto=""
-				ip="$(printf "%s" "${line}" | "${ban_awkcmd}" 'BEGIN{RS="(([0-9]{1,3}\\.){3}[0-9]{1,3})+"}{if(!seen[RT]++)printf "%s ",RT}')"
+				: >"${ban_rdapfile}"
+				if [ -z "${daemon}" ]; then
+					daemon="$(printf "%s" "${line}" | "${ban_awkcmd}" 'BEGIN{RS="dropbear"}{if(!seen[RT]++)printf "%s",RT}')"
+					[ -z "${daemon}" ] && daemon="sshd"
+				fi
+				ip="$(printf "%s" "${line}" | "${ban_awkcmd}" 'BEGIN{RS="(([1-9][0-9]{0,2}\\.){1}([0-9]{1,3}\\.){2}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5]))+"}{if(!seen[RT]++)printf "%s ",RT}')"
 				ip="$(f_trim "${ip}")"
 				ip="${ip##* }"
-				[ -n "${ip}" ] && proto="v4"
+				[ -n "${ip}" ] && [ "${ip%%.*}" != "127" ] && [ "${ip%%.*}" != "0" ] && proto="v4"
 				if [ -z "${proto}" ]; then
-					ip="$(printf "%s" "${line}" | "${ban_awkcmd}" 'BEGIN{RS="([A-Fa-f0-9]{1,4}::?){3,7}[A-Fa-f0-9]{1,4}"}{if(!seen[RT]++)printf "%s ",RT}')"
+					if [ "${daemon}" = "dropbear" ]; then
+						ip="$(printf "%s" "${line}" | "${ban_awkcmd}" 'BEGIN{RS="([A-Fa-f0-9]{1,4}::?){3,7}([A-Fa-f0-9]:?)+"}{if(!seen[RT]++)printf "%s ",RT}')"
+						ip="${ip%:*}"
+					else
+						ip="$(printf "%s" "${line}" | "${ban_awkcmd}" 'BEGIN{RS="([A-Fa-f0-9]{1,4}::?){3,7}[A-Fa-f0-9]{1,4}"}{if(!seen[RT]++)printf "%s ",RT}')"
+					fi
 					ip="$(f_trim "${ip}")"
 					ip="${ip##* }"
-					[ -n "${ip}" ] && proto="v6"
+					[ -n "${ip%%::*}" ] && proto="v6"
 				fi
-				if [ -n "${proto}" ] && ! "${ban_nftcmd}" get element inet banIP blocklist"${proto}" "{ ${ip} }" >/dev/null 2>&1 && ! "${ban_grepcmd}" -q "^${ip}" "${ban_allowlist}"; then
+				if [ -n "${proto}" ] && ! "${ban_nftcmd}" get element inet banIP allowlist"${proto}" "{ ${ip} }" >/dev/null 2>&1 && ! "${ban_nftcmd}" get element inet banIP blocklist"${proto}" "{ ${ip} }" >/dev/null 2>&1; then
 					f_log "info" "suspicious IP '${ip}'"
 					log_raw="$(eval ${loglimit_cmd})"
 					log_count="$(printf "%s\n" "${log_raw}" | "${ban_grepcmd}" -c "suspicious IP '${ip}'")"
 					if [ "${log_count}" -ge "${ban_logcount}" ]; then
+						if "${ban_nftcmd}" add element inet banIP "blocklist${proto}" { ${ip} ${nft_expiry} } >/dev/null 2>&1; then
+							f_log "info" "add IP '${ip}' (expiry: ${ban_nftexpiry:-"-"}) to blocklist${proto} set"
+						fi
 						if [ "${ban_autoblocksubnet}" = "1" ]; then
 							rdap_log="$("${ban_fetchcmd}" ${ban_rdapparm} "${ban_rdapfile}" "${ban_rdapurl}${ip}" 2>&1)"
 							rdap_rc="${?}"
 							if [ "${rdap_rc}" = "0" ] && [ -s "${ban_rdapfile}" ]; then
-								rdap_elements="$(jsonfilter -i "${ban_rdapfile}" -qe '@.cidr0_cidrs.*' | awk 'BEGIN{FS="[\" ]"}{printf "%s/%s, ",$6,$11}')"
-								rdap_info="$(jsonfilter -i "${ban_rdapfile}" -qe '@.country' -qe '@.notices[@.title="Source"].description[1]' | awk 'BEGIN{RS="";FS="\n"}{printf "%s, %s",$1,$2}')"
-								if [ -n "${rdap_elements//\/*/}" ]; then
-									if "${ban_nftcmd}" add element inet banIP "blocklist${proto}" "{ ${rdap_elements%%??} ${nft_expiry} }" >/dev/null 2>&1; then
-										f_log "info" "add IP range '${rdap_elements%%??}' (source: ${rdap_info:-"-"} ::: expiry: ${ban_nftexpiry:-"-"}) to blocklist${proto} set"
+								[ "${proto}" = "v4" ] && rdap_idx="$("${ban_jsoncmd}" -i "${ban_rdapfile}" -qe '@.cidr0_cidrs[@.v4prefix].*' | "${ban_awkcmd}" '{ORS=" "; print}')"
+								[ "${proto}" = "v6" ] && rdap_idx="$("${ban_jsoncmd}" -i "${ban_rdapfile}" -qe '@.cidr0_cidrs[@.v6prefix].*' | "${ban_awkcmd}" '{ORS=" "; print}')"
+								rdap_info="$("${ban_jsoncmd}" -l1 -i "${ban_rdapfile}" -qe '@.country' -qe '@.notices[@.title="Source"].description[1]' | "${ban_awkcmd}" 'BEGIN{RS="";FS="\n"}{printf "%s, %s",$1,$2}')"
+								[ -z "${rdap_info}" ] && rdap_info="$("${ban_jsoncmd}" -l1 -i "${ban_rdapfile}" -qe '@.notices[0].links[0].value' | "${ban_awkcmd}" 'BEGIN{FS="[/.]"}{printf"%s, %s","n/a",toupper($4)}')"
+								for idx in ${rdap_idx}; do
+									if [ -z "${prefix}" ]; then
+										prefix="${idx}"
+										continue
+									else
+										cidr="${prefix}/${idx}"
+										if "${ban_nftcmd}" add element inet banIP "blocklist${proto}" { ${cidr} ${nft_expiry} } >/dev/null 2>&1; then
+											f_log "info" "add IP range '${cidr}' (source: ${rdap_info:-"n/a"} ::: expiry: ${ban_nftexpiry:-"-"}) to blocklist${proto} set"
+										fi
+										prefix=""
 									fi
-								fi
+								done
 							else
 								f_log "info" "rdap request failed (rc: ${rdap_rc:-"-"}/log: ${rdap_log})"
 							fi
 						fi
-						if [ "${ban_autoblocksubnet}" = "0" ] || [ "${rdap_rc}" != "0" ] || [ ! -s "${ban_rdapfile}" ] || [ -z "${rdap_elements//\/*/}" ]; then
-							if "${ban_nftcmd}" add element inet banIP "blocklist${proto}" "{ ${ip} ${nft_expiry} }" >/dev/null 2>&1; then
-								f_log "info" "add IP '${ip}' (expiry: ${ban_nftexpiry:-"-"}) to blocklist${proto} set"
-							fi
-						fi
 						if [ -z "${ban_nftexpiry}" ] && [ "${ban_autoblocklist}" = "1" ] && ! "${ban_grepcmd}" -q "^${ip}" "${ban_blocklist}"; then
-							printf "%-42s%s\n" "${ip}" "# added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_blocklist}"
+							printf "%-45s%s\n" "${ip}" "# added on $(date "+%Y-%m-%d %H:%M:%S")" >>"${ban_blocklist}"
 							f_log "info" "add IP '${ip}' to local blocklist"
 						fi
 					fi
@@ -1571,12 +1739,26 @@ if [ -r "/lib/functions.sh" ] && [ -r "/lib/functions/network.sh" ] && [ -r "/us
 	. "/lib/functions/network.sh"
 	. "/usr/share/libubox/jshn.sh"
 else
-	rm -rf "${ban_lock}"
-	exit 1
+	f_log "emerg" "system libraries not found"
 fi
 
-# check banIP availability
+# reference required system utilities
 #
+ban_awkcmd="$(f_cmd gawk awk)"
+ban_catcmd="$(f_cmd cat)"
+ban_fw4cmd="$(f_cmd fw4)"
+ban_grepcmd="$(f_cmd grep)"
+ban_jsoncmd="$(f_cmd jsonfilter)"
+ban_logcmd="$(f_cmd logger)"
+ban_lookupcmd="$(f_cmd nslookup)"
+ban_mailcmd="$(f_cmd msmtp optional)"
+ban_nftcmd="$(f_cmd nft)"
+ban_pgrepcmd="$(f_cmd pgrep)"
+ban_sedcmd="$(f_cmd sed)"
+ban_ubuscmd="$(f_cmd ubus)"
+ban_zcatcmd="$(f_cmd zcat)"
+ban_gzipcmd="$(f_cmd gzip)"
+
 f_system
 if [ "${ban_action}" != "stop" ]; then
 	[ ! -d "/etc/banip" ] && f_log "err" "no banIP config directory"

@@ -8,9 +8,9 @@ PKG_MAINTAINER:=Thibaut VARÈNE <hacks@slashdirt.org>
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/f00b4r0/uspot.git
-PKG_SOURCE_DATE:=2023-11-30
-PKG_SOURCE_VERSION:=7e1e21b0f8425205d719b99a392fa893b3e512e6
-PKG_MIRROR_HASH:=494c616159b16d978fe00348ebe50c77a48f1db98d624ed613f3cca2d39e3a6e
+PKG_SOURCE_DATE:=2024-05-03
+PKG_SOURCE_VERSION:=92d3356d3fb3ae36199dbd494b5d9a9ae1a9db07
+PKG_MIRROR_HASH:=c7584c6b029c56d7c16156c007500ad61e2be29a6fd939f192ad6cb4444e1f2b
 
 CMAKE_SOURCE_SUBDIR:=src
 
@@ -22,10 +22,11 @@ define Package/uspot
   SECTION:=net
   CATEGORY:=Network
   TITLE:=uspot hotspot daemon
+  EXTRA_DEPENDS:=ucode (>= 2023-11-07)
   DEPENDS:=+conntrack \
 	   +libblobmsg-json +liblucihttp-ucode +libradcli +libubox +libubus +libuci \
-	   +spotfilter \
-	   +ucode +ucode-mod-math +ucode-mod-nl80211 +ucode-mod-rtnl +uhttpd-mod-ucode +ucode-mod-uloop
+	   +uspotfilter \
+	   +ucode +ucode-mod-log +ucode-mod-math +ucode-mod-nl80211 +ucode-mod-rtnl +uhttpd-mod-ucode +ucode-mod-uloop
 
 endef
 
@@ -49,6 +50,7 @@ define Package/uspot-www
   CATEGORY:=Network
   TITLE:=uspot default user interface files
   DEPENDS:=+uspot
+  PKGARCH:=all
 endef
 
 define Package/uspot-www/description
@@ -59,14 +61,14 @@ endef
 define Package/uspotfilter
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=uspot implementation of spotfilter
-  PROVIDES:=spotfilter
-  CONFLICTS:=spotfilter
+  TITLE:=uspot firewall interface
+  EXTRA_DEPENDS:=ucode (>= 2023-11-07)
   DEPENDS:=+conntrack +nftables-json +ucode +ucode-mod-rtnl +ucode-mod-uloop
+  PKGARCH:=all
 endef
 
 define Package/uspotfilter/description
-  This package provides the nftables firewall interface to spotfilter.
+  This package provides the nftables firewall interface to uspot.
   It is compatible with firewall4.
 endef
 
@@ -87,7 +89,7 @@ endef
 
 define Package/uspotfilter/install
 	$(INSTALL_DIR) $(1)/usr/share $(1)/etc/init.d
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/init.d/spotfilter $(1)/etc/init.d/spotfilter
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/init.d/uspotfilter $(1)/etc/init.d/uspotfilter
 	$(CP) $(PKG_BUILD_DIR)/files/usr/share/uspotfilter $(1)/usr/share/
 endef
 

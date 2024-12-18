@@ -43,9 +43,8 @@ To avoid these kind of deadlocks, travelmate will set all station interfaces to 
 
 ## Installation & Usage
 * **Please note:** before you start with travelmate ...
-    * you should setup at least one Access Point, ideally on a separate radio,
-    * if you're updating from a former 1.x release, please use the '--force-reinstall --force-maintainer' options in opkg,
-    * and remove any existing travelmate related uplink stations in your wireless config manually
+    * setup at least one AP, ideally on a separate radio
+    * if you're using a single radio unit set the AP channel to 'auto'
 * download [travelmate](https://downloads.openwrt.org/snapshots/packages/x86_64/packages)
 * download [luci-app-travelmate](https://downloads.openwrt.org/snapshots/packages/x86_64/luci)
 * install both packages (_opkg install travelmate_, _opkg install luci-app-travelmate_)
@@ -74,7 +73,6 @@ To avoid these kind of deadlocks, travelmate will set all station interfaces to 
 | trm_maxwait        | 30                                 | how long should travelmate wait for a successful wlan uplink connection                               |
 | trm_timeout        | 60                                 | overall retry timeout in seconds                                                                      |
 | trm_maxautoadd     | 5                                  | limit the max. number of automatically added open uplinks. To disable this limitation set it to '0'   |
-| trm_maxscan        | 10                                 | limit nearby scan results to process only the strongest uplinks                                       |
 | trm_captiveurl     | http://detectportal.firefox.com    | pre-configured provider URLs that will be used for connectivity- and captive portal checks            |
 | trm_useragent      | Mozilla/5.0 ...                    | pre-configured user agents that will be used for connectivity- and captive portal checks              |
 | trm_nice           | 0, normal priority                 | change the priority of the travelmate background processing                                           |
@@ -108,13 +106,18 @@ To avoid these kind of deadlocks, travelmate will set all station interfaces to 
 
 
 ## VPN client setup
-Please follow one of the following guides to get a working vpn client setup on your travel router:
+Please read one of the following guides to get a working vpn client setup on your travel router:
 
 * [Wireguard client setup guide](https://openwrt.org/docs/guide-user/services/vpn/wireguard/client)
-* [OpenVPN client setup guide](https://openwrt.org/docs/guide-user/services/vpn/openvpn/client)
+* [OpenVPN client setup guide](https://openwrt.org/docs/guide-user/services/vpn/openvpn/client-luci)
 
 **Please note:** Make sure to uncheck the "Bring up on boot" option during vpn interface setup, so that netifd doesn't interfere with travelmate.  
-Once your vpn client connection is running, you can reference to that setup in travelmate to handle VPN (re-) connections automatically.
+Also please prevent potential vpn protocol autostarts, e.g. add in newer openvpn uci configs an additional 'globals' section:  
+<pre><code>
+config globals 'globals'
+        option autostart '0'
+</code></pre>
+Once your vpn client connection setup is correct, you can reference to that config in travelmate to handle VPN (re-) connections automatically.
 
 ## E-Mail setup
 To use E-Mail notifications you have to setup the package 'msmtp'.  
@@ -187,6 +190,16 @@ Please join the travelmate discussion in this [forum thread](https://forum.lede-
 ## Removal
 * stop the travelmate daemon with _/etc/init.d/travelmate stop_
 * remove the travelmate package (_opkg remove luci-app-travelmate_, _opkg remove travelmate_)
+
+## Donations
+You like this project - is there a way to donate? Generally speaking "No" - I have a well-paying full-time job and my OpenWrt projects are just a hobby of mine in my spare time.  
+
+If you still insist to donate some bucks ...  
+* I would be happy if you put your money in kind into other, social projects in your area, e.g. a children's hospice
+* Let's meet and invite me for a coffee if you are in my area, the “Markgräfler Land” in southern Germany or in Switzerland (Basel)
+* Send your money to my [PayPal account](https://www.paypal.me/DirkBrenken) and I will collect your donations over the year to support various social projects in my area
+
+No matter what you decide - thank you very much for your support!  
 
 Have fun!  
 Dirk  
