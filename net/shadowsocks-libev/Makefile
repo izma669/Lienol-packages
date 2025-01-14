@@ -14,7 +14,7 @@ include $(TOPDIR)/rules.mk
 #
 PKG_NAME:=shadowsocks-libev
 PKG_VERSION:=3.3.5
-PKG_RELEASE:=11
+PKG_RELEASE:=12
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/shadowsocks/shadowsocks-libev/releases/download/v$(PKG_VERSION)
@@ -33,27 +33,6 @@ PKG_BUILD_PARALLEL:=1
 PKG_BUILD_DEPENDS:=c-ares pcre2
 
 include $(INCLUDE_DIR)/package.mk
-
-
-define Package/shadowsocks-libev-config
-  SECTION:=net
-  CATEGORY:=Network
-  SUBMENU:=Web Servers/Proxies
-  TITLE:=shadowsocks-libev config scripts
-  URL:=https://github.com/shadowsocks/shadowsocks-libev
-endef
-
-define Package/shadowsocks-libev-config/conffiles
-/etc/config/shadowsocks-libev
-endef
-
-define Package/shadowsocks-libev-config/install
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_DATA) ./files/shadowsocks-libev.config $(1)/etc/config/shadowsocks-libev
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/shadowsocks-libev.init $(1)/etc/init.d/shadowsocks-libev
-endef
-
 
 define Package/shadowsocks-libev/Default
   define Package/shadowsocks-libev-$(1)
@@ -83,27 +62,6 @@ define shadowsocks-libev/templates
 endef
 $(eval $(call shadowsocks-libev/templates))
 
-
-define Package/shadowsocks-libev-ss-rules
-  SECTION:=net
-  CATEGORY:=Network
-  SUBMENU:=Web Servers/Proxies
-  TITLE:=shadowsocks-libev ss-rules
-  URL:=https://github.com/shadowsocks/shadowsocks-libev
-  DEPENDS:=+firewall4 \
-	   +ip \
-	   +resolveip \
-	   +ucode \
-	   +ucode-mod-fs \
-	   +shadowsocks-libev-ss-redir \
-	   +kmod-nft-tproxy
-endef
-
-define Package/shadowsocks-libev-ss-rules/install
-	$(INSTALL_DIR) $(1)/usr/share/ss-rules
-	$(INSTALL_DATA) ./files/ss-rules/* $(1)/usr/share/ss-rules/
-endef
-
 define Build/Prepare
 	$(call Build/Prepare/Default)
 	$(FIND) $(PKG_BUILD_DIR) \
@@ -122,8 +80,6 @@ CONFIGURE_ARGS += \
 
 TARGET_LDFLAGS += -Wl,--gc-sections,--as-needed
 
-$(eval $(call BuildPackage,shadowsocks-libev-config))
-$(eval $(call BuildPackage,shadowsocks-libev-ss-rules))
 $(foreach component,$(SHADOWSOCKS_COMPONENTS), \
   $(eval $(call BuildPackage,shadowsocks-libev-$(component))) \
 )
