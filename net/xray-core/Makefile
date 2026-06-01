@@ -26,6 +26,12 @@ GO_PKG_LDFLAGS_X:= \
 include $(INCLUDE_DIR)/package.mk
 include ../../lang/golang/golang-package.mk
 
+ifneq ($(CONFIG_MIPS16_OPT),)
+override CGO_CFLAGS_FILTER := -mips16 -minterlink-mips16
+GO_PKG_BUILD_VARS += \
+    CGO_CFLAGS="$(filter-out $(CGO_CFLAGS_FILTER),$(TARGET_CFLAGS))"
+endif
+
 define Package/xray/template
   TITLE:=A platform for building proxies to bypass network restrictions
   SECTION:=net
