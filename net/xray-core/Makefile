@@ -19,9 +19,12 @@ PKG_USE_MIPS16:=0
 include $(INCLUDE_DIR)/package.mk
 
 # ---------------------------------------------------------------------------
-# 19.07 鑷甫 golang 鏄?1.18锛岀紪涓嶄簡 xray 1.8.3锛堥渶瑕?Go >= 1.20锛夈€?# 杩欓噷鍙湪鏈寘鍐呴儴瑙ｅ喅锛氱敤涓€浠界嫭绔嬬殑 Go 1.20 宸ュ叿閾惧仛浜ゅ弶缂栬瘧锛?# 涓嶆敼 golang 鍖呫€佷笉棰勭疆浜岃繘鍒躲€?#   - 浼樺厛浣跨敤缂栬瘧鏈轰笂宸叉湁鐨?Go 1.20/1.21锛?HOME/go-1.20.14 绛夛級
-#   - 娌℃湁灏辫嚜鍔ㄤ笅杞藉搴旂紪璇戞満鏋舵瀯鐨?Go 1.20.14 鍒?dl/
-# 鐩爣鏋舵瀯鎸?OpenWrt 鐨?$(ARCH) 鑷姩鏄犲皠锛宎rm / mips / mipsel / arm64 / x86 閮借兘鍑哄寘銆?# ---------------------------------------------------------------------------
+# OpenWrt 19.07 ships golang 1.18, which cannot build xray 1.8.3 (needs Go >= 1.20).
+# This package carries its own Go toolchain (downloaded once into dl/), so the
+# golang package and other packages are left untouched.
+#   - host arch is detected with uname -m (amd64 / arm64)
+#   - target arch is mapped from OpenWrt ARCH (arm / mips / mipsel / mips64 ...)
+# ---------------------------------------------------------------------------
 
 GO_VER:=1.20.14
 GO_HOST_ARCH:=$(shell uname -m)
