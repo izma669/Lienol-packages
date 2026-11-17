@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=xray-core
 PKG_VERSION:=1.8.3
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/XTLS/Xray-core/tar.gz/v$(PKG_VERSION)?
@@ -13,18 +13,72 @@ PKG_LICENSE:=MPL-2.0
 PKG_LICENSE_FILES:=LICENSE
 
 PKG_BUILD_DIR:=$(BUILD_DIR)/Xray-core-$(PKG_VERSION)
-PKG_BUILD_DEPENDS:=golang/host
 PKG_BUILD_PARALLEL:=1
 PKG_USE_MIPS16:=0
 
-GO_PKG:=github.com/xtls/xray-core
-GO_PKG_BUILD_PKG:=github.com/xtls/xray-core/main
-GO_PKG_LDFLAGS_X:= \
-	$(GO_PKG)/core.build=OpenWrt \
-	$(GO_PKG)/core.version=$(PKG_VERSION)
-
 include $(INCLUDE_DIR)/package.mk
-include ../../lang/golang/golang-package.mk
+
+# ---------------------------------------------------------------------------
+# 19.07 鑷甫 golang 鏄?1.18锛岀紪涓嶄簡 xray 1.8.3锛堥渶瑕?Go >= 1.20锛夈€?# 杩欓噷鍙湪鏈寘鍐呴儴瑙ｅ喅锛氱敤涓€浠界嫭绔嬬殑 Go 1.20 宸ュ叿閾惧仛浜ゅ弶缂栬瘧锛?# 涓嶆敼 golang 鍖呫€佷笉棰勭疆浜岃繘鍒躲€?#   - 浼樺厛浣跨敤缂栬瘧鏈轰笂宸叉湁鐨?Go 1.20/1.21锛?HOME/go-1.20.14 绛夛級
+#   - 娌℃湁灏辫嚜鍔ㄤ笅杞藉搴旂紪璇戞満鏋舵瀯鐨?Go 1.20.14 鍒?dl/
+# 鐩爣鏋舵瀯鎸?OpenWrt 鐨?$(ARCH) 鑷姩鏄犲皠锛宎rm / mips / mipsel / arm64 / x86 閮借兘鍑哄寘銆?# ---------------------------------------------------------------------------
+
+GO_VER:=1.20.14
+GO_HOST_ARCH:=$(shell uname -m)
+GO_TARBALL_amd64:=go$(GO_VER).linux-amd64.tar.gz
+GO_TARBALL_x86_64:=go$(GO_VER).linux-amd64.tar.gz
+GO_TARBALL_aarch64:=go$(GO_VER).linux-arm64.tar.gz
+GO_TARBALL_arm64:=go$(GO_VER).linux-arm64.tar.gz
+GO_TARBALL:=$(GO_TARBALL_$(GO_HOST_ARCH))
+GO_URL:=https://mirrors.aliyun.com/golang/$(GO_TARBALL)
+GO_URL_FALLBACK:=https://go.dev/dl/$(GO_TARBALL)
+GO_HOST_DIR:=$(BUILD_DIR)/go-$(GO_VER)-host
+
+# OpenWrt ARCH -> Go GOARCH
+GO_ARCH_arm:=arm
+GO_ARCH_aarch64:=arm64
+GO_ARCH_mips:=mips
+GO_ARCH_mipsel:=mipsle
+GO_ARCH_mips64:=mips64
+GO_ARCH_mips64el:=mips64le
+GO_ARCH_i386:=386
+GO_ARCH_x86_64:=amd64
+GO_ARCH_powerpc:=ppc64
+GO_ARCH_powerpc64:=ppc64
+GO_ARCH_riscv64:=riscv64
+GOARCH_XRAY:=$(GO_ARCH_$(ARCH))
+
+ifeq ($(GOARCH_XRAY),arm)
+  GO_ARM_ENV:=GOARM=7
+endif
+ifeq ($(GOARCH_XRAY),mips)
+  GO_MIPS_ENV:=GOMIPS=softfloat
+endif
+ifeq ($(GOARCH_XRAY),mipsle)
+  GO_MIPS_ENV:=GOMIPS=softfloat
+endif
+
+GOPROXY_XRAY?=https://goproxy.cn,direct
+
+define Build/Compile
+	@set -e; \
+	if [ ! -x "$(GO_HOST_DIR)/bin/go" ]; then \
+		mkdir -p "$(GO_HOST_DIR)"; \
+		if [ ! -f "$(DL_DIR)/$(GO_TARBALL)" ]; then \
+			echo "Downloading $(GO_TARBALL) ..."; \
+			curl -fsSL -o "$(DL_DIR)/$(GO_TARBALL).tmp" "$(GO_URL)" || \
+			curl -fsSL -o "$(DL_DIR)/$(GO_TARBALL).tmp" "$(GO_URL_FALLBACK)"; \
+			mv "$(DL_DIR)/$(GO_TARBALL).tmp" "$(DL_DIR)/$(GO_TARBALL)"; \
+		fi; \
+		tar -C "$(GO_HOST_DIR)" --strip-components=1 -xzf "$(DL_DIR)/$(GO_TARBALL)"; \
+	fi; \
+	cd "$(PKG_BUILD_DIR)" && \
+	GOOS=linux GOARCH="$(GOARCH_XRAY)" $(GO_ARM_ENV) $(GO_MIPS_ENV) CGO_ENABLED=0 \
+	GOPROXY="$(GOPROXY_XRAY)" \
+	"$(GO_HOST_DIR)/bin/go" build -trimpath -buildvcs=false \
+		-ldflags "-s -w -X github.com/xtls/xray-core/core.build=OpenWrt -X github.com/xtls/xray-core/core.version=$(PKG_VERSION)" \
+		-o "$(PKG_BUILD_DIR)/xray" ./main
+endef
 
 define Package/xray/template
   TITLE:=A platform for building proxies to bypass network restrictions
@@ -35,7 +89,7 @@ endef
 
 define Package/xray-core
   $(call Package/xray/template)
-  DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle
+  DEPENDS:=+ca-bundle
 endef
 
 define Package/xray-example
@@ -66,9 +120,8 @@ define Package/xray-core/conffiles
 endef
 
 define Package/xray-core/install
-	$(call GoPackage/Package/Install/Bin,$(PKG_INSTALL_DIR))
 	$(INSTALL_DIR) $(1)/usr/bin/
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/main $(1)/usr/bin/xray
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/xray $(1)/usr/bin/xray
 
 	$(INSTALL_DIR) $(1)/etc/xray/
 	$(INSTALL_DATA) $(CURDIR)/files/config.json.example $(1)/etc/xray/
