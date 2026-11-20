@@ -58,7 +58,14 @@ minidlna_create_config() {
 	minidlna_cfg_addstr "$cfg" friendly_name
 	minidlna_cfg_addstr "$cfg" user
 	minidlna_cfg_addstr "$cfg" db_dir
+	minidlna_cfg_addstr "$cfg" log_dir
 	minidlna_cfg_addstr "$cfg" log_level 'error'
+	minidlna_cfg_addstr "$cfg" max_connections '50'
+	minidlna_cfg_addbool "$cfg" merge_media_dirs '0'
+	minidlna_cfg_addstr "$cfg" force_sort_criteria
+	minidlna_cfg_addstr "$cfg" tivo_discovery
+	minidlna_cfg_addbool "$cfg" enable_subtitles '1'
+	minidlna_cfg_addstr "$cfg" model_name
 	minidlna_cfg_addbool "$cfg" inotify '1'
 	minidlna_cfg_addbool "$cfg" enable_tivo '0'
 	minidlna_cfg_addbool "$cfg" wide_links '0'
@@ -81,6 +88,7 @@ start_service() {
 	local db_dir
 	local user
 	local val
+	local expose_cue expose_lrc flags
 
 	config_load 'minidlna'
 	config_get_bool enabled config 'enabled' '0'
@@ -94,6 +102,16 @@ start_service() {
 
 	config_get db_dir config 'db_dir' '/var/run/minidlna'
 	config_get user config 'user' 'minidlna'
+
+	# Reset the media database when the .cue/.lrc switches change,
+	# otherwise the old index would not match the new settings.
+	config_get_bool expose_cue config 'expose_cue' '0'
+	config_get_bool expose_lrc config 'expose_lrc' '0'
+	flags="expose_cue=$expose_cue;expose_lrc=$expose_lrc"
+	if [ "$flags" != "$(cat /var/run/minidlna.cue_flags 2>/dev/null)" ]; then
+		echo "$flags" > /var/run/minidlna.cue_flags
+		rm -rf "$db_dir"/files.db* "$db_dir/art_cache"
+	fi
 
 	[ -d "$db_dir" ] || {
 		mkdir -m 755 -p "$db_dir"
